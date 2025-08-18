@@ -1,0 +1,184 @@
+---
+title: "TermineR Results Visualization"
+author: "Your Name"
+format:
+  html:
+    code-fold: true
+    code-summary: "Show the code"
+    toc: true
+    toc-depth: 3
+    number-sections: false
+    embed-resources: true
+    df-print: paged
+    max-width: "1200px"
+editor: source
+execute:
+  eval: true
+  echo: false
+  error: false
+  warning: false
+  message: false
+  cache: true
+---
+
+# Setup and Load Results
+
+```{r setup}
+#| cache: false
+# Load required libraries
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(here)
+  library(ggpubr)
+  library(pheatmap)
+  library(RColorBrewer)
+  library(ComplexHeatmap)
+  library(mixOmics)
+})
+
+# Set parameters
+rds_dir <- here("rds")
+results_dir <- here("results")
+plot_width <- 12
+plot_height <- 8
+fc_threshold <- 2.5
+pval_threshold <- 0.05
+```
+
+```{r load_data}
+#| cache: true
+# Load pre-computed results
+exploratory_results <- read_rds(file.path(rds_dir, "exploratory_results.rds"))
+limma_results <- read_rds(file.path(rds_dir, "limma_results.rds"))
+
+# Extract key objects
+experimental_design <- exploratory_results$experimental_design
+all_results <- limma_results$all_results
+params <- exploratory_results$parameters
+pre_fix <- params$pre_fix
+```
+
+# Volcano Plots
+
+```{r volcano_plots}
+#| fig-width: !expr plot_width
+#| fig-height: !expr plot_height
+
+create_volcano_plot <- function(data, contrast_name) {
+  data %>%
+    filter(contrast == contrast_name) %>%
+    mutate(
+      regulation = case_when(
+        adj.P.Val < pval_threshold & logFC > log2(fc_threshold) ~ "upregulated",
+        adj.P.Val < pval_threshold & logFC < -log2(fc_threshold) ~ "downregulated",
+        TRUE ~ "not_significant"
+      ),
+      neg_log10_pval = -log10(adj.P.Val)
+    ) %>%
+    ggplot(aes(x = logFC, y = neg_log10_pval, color = regulation)) +
+    geom_point(alpha = 0.6) +
+    scale_color_manual(values = c(
+      "upregulated" = "red",
+      "downregulated" = "blue",
+      "not_significant" = "gray"
+    )) +
+    geom_vline(xintercept = c(-log2(fc_threshold), log2(fc_threshold)), 
+               linetype = "dashed", alpha = 0.5) +
+    geom_hline(yintercept = -log10(pval_threshold), 
+               linetype = "dashed", alpha = 0.5) +
+    labs(
+      title = paste("Volcano Plot -", contrast_name),
+      x = "Log2 Fold Change",
+      y = "-Log10 Adjusted P-value"
+    ) +
+    theme_minimal()
+}
+
+# Create volcano plots for each contrast
+contrast_names <- unique(all_results$contrast)
+volcano_plots <- map(contrast_names, ~create_volcano_plot(all_results, .x))
+names(volcano_plots) <- contrast_names
+
+# Display plots
+walk(volcano_plots, print)
+```
+
+# Heatmaps
+
+```{r heatmaps}
+#| fig-width: !expr plot_width
+#| fig-height: !expr plot_height
+
+# Create heatmap of significantly regulated features
+create_regulation_heatmap <- function(results_data, top_n = 50) {
+  # Get top regulated features
+  top_features <- results_data %>%
+    filter(adj.P.Val < pval_threshold) %>%
+    arrange(adj.P.Val) %>%
+    slice_head(n = top_n)
+  
+  if (nrow(top_features) == 0) {
+    message("No significantly regulated features found for heatmap.")
+    return(NULL)
+  }
+  
+  # Create matrix for heatmap
+  heatmap_matrix <- top_features %>%
+    select(nterm_modif_peptide, contrast, logFC) %>%
+    pivot_wider(names_from = contrast, values_from = logFC, values_fill = 0) %>%
+    column_to_rownames("nterm_modif_peptide") %>%
+    as.matrix()
+  
+  # Create heatmap
+  pheatmap(
+    heatmap_matrix,
+    scale = "none",
+    clustering_distance_rows = "correlation",
+    clustering_distance_cols = "correlation",
+    color = colorRampPalette(c("blue", "white", "red"))(100),
+    main = paste("Top", top_n, "Regulated Features"),
+    fontsize_row = 8,
+    fontsize_col = 10
+  )
+}
+
+regulation_heatmap <- create_regulation_heatmap(all_results)
+if (!is.null(regulation_heatmap)) {
+  print(regulation_heatmap)
+}
+```
+
+# Summary Statistics
+
+```{r summary_stats}
+# Generate summary statistics
+summary_stats <- all_results %>%
+  group_by(contrast) %>%
+  summarise(
+    total_features = n(),
+    upregulated = sum(adj.P.Val < pval_threshold & logFC > log2(fc_threshold)),
+    downregulated = sum(adj.P.Val < pval_threshold & logFC < -log2(fc_threshold)),
+    not_significant = sum(adj.P.Val >= pval_threshold | abs(logFC) <= log2(fc_threshold)),
+    .groups = 'drop'
+  )
+
+knitr::kable(summary_stats, caption = "Summary of Differential Analysis Results")
+```
+
+# Save Plots and Summary
+
+```{r save_results}
+# Save summary statistics
+write_tsv(
+  summary_stats,
+  file.path(results_dir, paste0(pre_fix, "summary_statistics.tsv"))
+)
+
+message("Visualization analysis complete. Results saved.")
+```
+
+# Session Information
+
+```{r session_info}
+sessionInfo()
+```

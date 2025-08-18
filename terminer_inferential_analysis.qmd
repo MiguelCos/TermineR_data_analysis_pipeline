@@ -1,0 +1,271 @@
+---
+title: "TermineR Inferential Analysis"
+author: "Your Name"
+format:
+  html:
+    code-fold: true
+    code-summary: "Show the code"
+    toc: true
+    toc-depth: 3
+    number-sections: false
+    embed-resources: true
+    df-print: paged
+    max-width: "1200px"
+editor: source
+execute:
+  eval: true
+  echo: false
+  error: false
+  warning: false
+  message: false
+  cache: true
+---
+
+# Setup and Load Data
+
+```{r setup}
+#| cache: false
+# Load required libraries
+suppressPackageStartupMessages({
+  library(TermineR)
+  library(tidyverse)
+  library(limma)
+  library(SummarizedExperiment)
+  library(clusterProfiler)
+  library(org.Hs.eg.db)  # Change based on organism
+  library(here)
+  library(ggpubr)
+  library(ComplexHeatmap)
+})
+
+# Set options and directories
+options(max.print = 1000, scipen = 999, stringsAsFactors = FALSE)
+rds_dir <- here("rds")
+results_dir <- here("results")
+dir.create(results_dir, showWarnings = FALSE, recursive = TRUE)
+
+# Plot parameters
+plot_width <- 10
+plot_height <- 8
+```
+
+```{r load_exploratory_results}
+#| cache: true
+# Load results from exploratory analysis
+exploratory_results <- read_rds(file.path(rds_dir, "exploratory_results.rds"))
+
+# Extract objects
+annotated_df_quant <- exploratory_results$annotated_df_quant
+se_pept_imp_raw <- exploratory_results$se_pept_imp_raw
+experimental_design <- exploratory_results$experimental_design
+prot2gene <- exploratory_results$prot2gene
+params <- exploratory_results$parameters
+
+# Analysis parameters
+fc_threshold <- 2.5
+pval_threshold <- 0.05
+pre_fix <- params$pre_fix
+```
+
+```{r define_contrasts}
+#| cache: false
+# Define contrasts for differential analysis
+defined_contrasts <- c(
+  "Treatment_vs_Control" = "Treatment - Control"
+  # Add more contrasts as needed
+)
+
+# Convert contrasts for limma
+contrasts_list <- lapply(names(defined_contrasts), function(name) {
+  contrast <- defined_contrasts[[name]]
+  parse(text = contrast)[[1]]
+})
+```
+
+# Protein-Level Normalization
+
+```{r protein_normalization}
+#| cache: true
+
+rds_path_protnorm <- file.path(rds_dir, "protein_normalized_data.rds")
+
+if (file.exists(rds_path_protnorm)) {
+  message("Loading cached protein normalization results...")
+  protein_norm_results <- read_rds(rds_path_protnorm)
+} else {
+  message("Performing protein-level normalization...")
+  
+  # Prepare data for normalization
+  quant_matrix <- assay(se_pept_imp_raw)
+  peptide_annot <- as.data.frame(rowData(se_pept_imp_raw)) %>%
+    select(nterm_modif_peptide, peptide, protein, nterm_modif, specificity)
+  
+  # Convert matrix to data frame for normalization
+  pept_q_raw_nona <- quant_matrix %>%
+    as.data.frame() %>%
+    rownames_to_column("nterm_modif_peptide")
+  
+  # Perform protein normalization
+  protein_norm_results <- peptide2protein_normalization(
+    peptides = pept_q_raw_nona,
+    annot = experimental_design,
+    peptide_annot = peptide_annot,
+    summarize_by_specificity = TRUE
+  )
+  
+  write_rds(protein_norm_results, rds_path_protnorm)
+}
+```
+
+# Differential Abundance Analysis
+
+```{r differential_analysis}
+#| cache: true
+
+rds_path_limma <- file.path(rds_dir, "limma_results.rds")
+
+if (file.exists(rds_path_limma)) {
+  message("Loading cached differential analysis results...")
+  limma_results <- read_rds(rds_path_limma)
+} else {
+  message("Performing differential abundance analysis...")
+  
+  # Prepare protein-normalized data
+  mat_prot_norm <- protein_norm_results$protein_normalized_pepts_scaled %>%
+    select(nterm_modif_peptide, matches("fraction_int_")) %>%
+    column_to_rownames("nterm_modif_peptide") %>%
+    as.matrix()
+  
+  colnames(mat_prot_norm) <- str_remove(colnames(mat_prot_norm), "fraction_int_peptide2prot_")
+  
+  # Create SummarizedExperiment for normalized data
+  annot_prot_norm <- protein_norm_results$protein_normalized_pepts_scaled %>%
+    select(nterm_modif_peptide, nterm_modif:protein_sequence) %>%
+    left_join(as.data.frame(rowData(se_pept_imp_raw)))
+  
+  se_pept_protnorm <- SummarizedExperiment(
+    assays = list(counts = mat_prot_norm),
+    colData = experimental_design,
+    rowData = annot_prot_norm
+  )
+  
+  # Run limma analysis
+  condition <- colData(se_pept_protnorm)$condition
+  design <- model.matrix(~ 0 + condition)
+  rownames(design) <- rownames(colData(se_pept_protnorm))
+  colnames(design) <- str_remove(colnames(design), "condition")
+  
+  cont.matrix <- do.call(makeContrasts, c(contrasts_list, list(levels = design)))
+  
+  fit1 <- lmFit(mat_prot_norm, design, method = "robust")
+  fit2 <- contrasts.fit(fit1, cont.matrix)
+  fit2 <- eBayes(fit2)
+  
+  # Generate topTables
+  get_top_tables <- function(x) {
+    topTable(fit2, coef = x, number = Inf, adjust.method = "BH") %>%
+      rownames_to_column(var = "nterm_modif_peptide") %>%
+      left_join(as.data.frame(rowData(se_pept_protnorm)))
+  }
+  
+  topTables <- map(defined_contrasts, get_top_tables)
+  all_results <- bind_rows(topTables, .id = "contrast")
+  
+  limma_results <- list(
+    topTables = topTables,
+    all_results = all_results,
+    se_pept_protnorm = se_pept_protnorm
+  )
+  
+  write_rds(limma_results, rds_path_limma)
+}
+```
+
+# GO Enrichment Analysis
+
+```{r go_enrichment}
+#| cache: true
+
+rds_path_go <- file.path(rds_dir, "go_enrichment_results.rds")
+
+if (file.exists(rds_path_go)) {
+  message("Loading cached GO enrichment results...")
+  go_results <- read_rds(rds_path_go)
+} else {
+  message("Performing GO enrichment analysis...")
+  
+  # Prepare data for GO analysis
+  upregulated_features <- limma_results$all_results %>%
+    filter(adj.P.Val < pval_threshold, logFC > log2(fc_threshold)) %>%
+    mutate(regulation = "upregulated")
+  
+  # GO enrichment for upregulated features
+  go_bp_res <- compareCluster(
+    gene ~ contrast,
+    data = upregulated_features,
+    fun = "enrichGO",
+    OrgDb = org.Hs.eg.db,  # Change based on organism
+    keyType = "SYMBOL",
+    ont = "BP",
+    pvalueCutoff = 0.05,
+    pAdjustMethod = "BH",
+    universe = unique(limma_results$all_results$gene),
+    qvalueCutoff = 0.2,
+    minGSSize = 10,
+    maxGSSize = 500,
+    readable = TRUE
+  )
+  
+  go_results <- list(
+    go_bp = go_bp_res,
+    upregulated_features = upregulated_features
+  )
+  
+  write_rds(go_results, rds_path_go)
+}
+```
+
+```{r plot_go_results}
+#| fig-width: !expr plot_width
+#| fig-height: !expr plot_height
+
+if (nrow(go_results$go_bp) > 0) {
+  dotplot(go_results$go_bp, showCategory = 10) +
+    labs(title = "GO Biological Process Enrichment")
+} else {
+  message("No significant GO terms found.")
+}
+```
+
+# Save Results
+
+```{r save_results}
+#| cache: true
+
+# Save main results tables
+write_tsv(
+  limma_results$all_results %>%
+    mutate(regulation = case_when(
+      adj.P.Val < pval_threshold & logFC > log2(fc_threshold) ~ "upregulated",
+      adj.P.Val < pval_threshold & logFC < -log2(fc_threshold) ~ "downregulated",
+      TRUE ~ "not_significant"
+    )),
+  file.path(results_dir, paste0(pre_fix, "differential_analysis_results.tsv"))
+)
+
+# Save GO results if available
+if (exists("go_results") && nrow(go_results$go_bp) > 0) {
+  write_tsv(
+    as.data.frame(go_results$go_bp),
+    file.path(results_dir, paste0(pre_fix, "go_enrichment_results.tsv"))
+  )
+}
+
+message("Inferential analysis complete. Results saved.")
+```
+
+# Session Information
+
+```{r session_info}
+sessionInfo()
+```

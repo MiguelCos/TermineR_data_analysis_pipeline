@@ -1,0 +1,665 @@
+---
+title: "TermineR Exploratory Analysis"
+author: "Your Name"
+format:
+  html:
+    code-fold: true
+    code-summary: "Show the code"
+    toc: true
+    toc-depth: 3
+    number-sections: false
+    embed-resources: true
+    df-print: paged
+    max-width: "1200px"
+editor: source
+execute:
+  eval: true
+  echo: false
+  error: false
+  warning: false
+  message: false
+  cache: true
+---
+
+# Setup and Parameters
+
+```{r setup}
+#| cache: false
+# Load required libraries
+suppressPackageStartupMessages({
+  library(TermineR)
+  library(tidyverse)
+  library(here)
+  library(arrow)
+  library(SummarizedExperiment)
+  library(ggpubr)
+  library(pheatmap)
+  library(RColorBrewer)
+  library(mixOmics)
+  library(naniar)
+  library(kableExtra)
+  library(janitor)
+
+})
+
+# Set options
+options(max.print = 1000, scipen = 999, stringsAsFactors = FALSE)
+
+# Source helper functions
+source(here("scr/modif_diann_adapter.R"))
+source(here("scr/helper_functions.R"))
+
+# Create results directories
+dir.create(here("results"), showWarnings = FALSE, recursive = TRUE)
+dir.create(here("rds"), showWarnings = FALSE, recursive = TRUE)
+rds_dir <- here("rds")
+```
+
+```{r define_parameters}
+#| cache: false
+# === SEARCH ENGINE CONFIGURATION ===
+search_engine <- "diann"  # Options: "diann", "fragpipe_tmt", "fragpipe_lf", "fragpipe_heavy_light", "spectronaut"
+
+# === DATA LOCATIONS (adjust based on search engine) ===
+# For DIA-NN
+diann_report_location <- here("initial_data/report.parquet")  # Can be .parquet or .tsv
+
+# For FragPipe TMT
+fragpipe_parent_dir <- here("initial_data/fragpipe_search")  # Directory containing mix folders
+
+# For FragPipe Label-Free
+fragpipe_lf_parent_dir <- here("initial_data/fragpipe_lf_search")
+fragpipe_lf_annotation <- here("initial_data/fragpipe_lf_annotation.txt")
+
+# For FragPipe Heavy-Light
+fragpipe_hl_file <- here("initial_data/combined_modified_peptide_label_quant.tsv")
+fragpipe_hl_annotation <- here("initial_data/fragpipe_hl_annotation.txt")
+
+# For Spectronaut
+spectronaut_report <- here("initial_data/spectronaut_report.tsv")
+
+# Common files
+location_annotation <- here("initial_data/experimental_annotation.txt")
+fasta_location <- here("initial_data/proteome.fasta")
+targetp_location <- here("initial_data/targetp_results.targetp2")  # Set to NULL if not available
+
+# === EXPERIMENTAL PARAMETERS ===
+sense_protease <- "C"  # "C" for C-terminal cleavage (trypsin), "N" for N-terminal
+specificity_protease <- "K|R"  # Trypsin specificity
+organism_annotation <- "human"  # Options: "human", "mouse", "arabidopsis", etc.
+instrument <- "EX"  # Instrument prefix in sample names
+
+# === SEARCH ENGINE SPECIFIC PARAMETERS ===
+# FragPipe TMT parameters
+ref_sample <- "norm"  # Reference channel for TMT normalization
+min_purity <- 0.5  # Minimum PSM purity
+tmt_delta <- "229"  # TMT delta mass ("229" for TMT10/11, "304" for TMT16)
+
+# DIA-NN parameters
+proteotypic_only <- TRUE  # Use only proteotypic peptides
+summarization_method <- "SUM"  # "SUM" or "MAX" for precursor summarization
+
+# === ANALYSIS PARAMETERS ===
+missing_accepted <- 2 / 4  # Max missing values per condition (2 out of 4 replicates)
+pre_fix <- "terminer_analysis_"  # Prefix for output files
+
+# === PLOT PARAMETERS ===
+plot_width <- 10
+plot_height <- 10
+plot_dpi <- 300
+```
+
+# Data Loading and Annotation
+
+```{r load_data}
+#| cache: true
+# Load data based on search engine
+rds_path_data <- file.path(rds_dir, paste0(search_engine, "_data.rds"))
+
+if (file.exists(rds_path_data)) {
+
+  message("Loading cached ", search_engine, " data...")
+  df_from_search <- read_rds(rds_path_data)
+  
+} else {
+  message("Loading ", search_engine, " data...")
+  
+  # Load data based on search engine type
+  df_from_search <- switch(search_engine,
+    "diann" = {
+      # DIA-NN data loading
+      file_ext <- tools::file_ext(diann_report_location)
+      
+      if (file_ext == "parquet") {
+        message("Using parquet adapter for DIA-NN report.parquet file...")
+        diann_adapter_parquet(
+          path_to_file = diann_report_location,
+          proteotypic = proteotypic_only,
+          summarization = summarization_method
+        )
+      } else if (file_ext == "tsv") {
+        message("Using standard diann_adapter for DIA-NN report.tsv file...")
+        result <- diann_adapter(
+          path_to_file = diann_report_location,
+          proteotypic = proteotypic_only,
+          summarization = summarization_method
+        )
+        # Clean column names for TSV files
+        result %>% rename_with(~ str_remove(., "_.*"), starts_with(instrument))
+      } else {
+        stop("Unsupported DIA-NN file format. Please use either .parquet or .tsv files.")
+      }
+    },
+    
+    "fragpipe_tmt" = {
+      message("Using FragPipe TMT adapter...")
+      fragpipe_adapter(
+        parent_dir = fragpipe_parent_dir,
+        ref_sample = ref_sample,
+        grouping_var = "nterm_modif_peptide",
+        min_purity = min_purity,
+        tmt_delta = tmt_delta
+      )
+    },
+    
+    "fragpipe_lf" = {
+      message("Using FragPipe Label-Free adapter...")
+      fragpipe_lf_adapter(
+        parent_dir = fragpipe_lf_parent_dir,
+        annotation_file_path = fragpipe_lf_annotation,
+        grouping_var = "nterm_modif_peptide"
+      )
+    },
+    
+    "fragpipe_heavy_light" = {
+      message("Using FragPipe Heavy-Light adapter...")
+      fragpipe_dda_heavy_light_adapter(
+        combined_modified_peptide_file = fragpipe_hl_file,
+        annotation_file_path = fragpipe_hl_annotation,
+        grouping_var = "nterm_modif_peptide"
+      )
+    },
+    
+    "spectronaut" = {
+      message("Using Spectronaut adapter...")
+      spectronaut_adapter(
+        path_to_file = spectronaut_report,
+        proteotypic = proteotypic_only
+      )
+    },
+    
+    stop("Unsupported search engine: ", search_engine, 
+         ". Supported options: diann, fragpipe_tmt, fragpipe_lf, fragpipe_heavy_light, spectronaut")
+  )
+  
+  write_rds(df_from_search, rds_path_data)
+}
+
+# Load experimental design (adapt based on search engine)
+if (search_engine %in% c("fragpipe_lf", "fragpipe_heavy_light")) {
+  # For FragPipe LF and Heavy-Light, experimental design is handled internally
+  experimental_design <- tribble(
+    ~sample, ~condition, ~bio_replicate,
+    # This will be populated based on the specific adapter used
+  )
+  message("Experimental design extracted from FragPipe adapter results")
+} else {
+  # For other search engines, load external annotation file
+  experimental_design <- read_delim(location_annotation) %>%
+    filter(condition != "empty") %>%
+    {if("bio_replicate" %in% names(.)) mutate(., replicate = bio_replicate) else .}
+}
+
+# Load protein to gene mapping (adapt based on search engine and data availability)
+if (search_engine == "diann" && file.exists(diann_report_location)) {
+  prot2gene <- arrow::open_dataset(diann_report_location) %>%
+    dplyr::select(protein = Protein.Ids, gene = Genes) %>%
+    collect() %>%
+    distinct() %>%
+    separate_rows(gene, sep = ",") %>%
+    distinct()
+} else if (search_engine %in% c("fragpipe_tmt", "fragpipe_lf")) {
+  # For FragPipe, look for PSM files
+  message("Looking for FragPipe PSM files for protein-to-gene mapping...")
+  
+  # Determine parent directory based on search engine
+  parent_dir <- if (search_engine == "fragpipe_tmt") fragpipe_parent_dir else fragpipe_lf_parent_dir
+  
+  # Find all psm.tsv files
+  psm_files <- list.files(parent_dir, pattern = "psm\\.tsv$", recursive = TRUE, full.names = TRUE)
+  
+  if (length(psm_files) > 0) {
+    message("Found ", length(psm_files), " PSM files. Reading protein mapping...")
+    
+    # Read and combine protein mapping from all PSM files
+    prot2gene <- map_dfr(psm_files, ~{
+      tryCatch({
+        read_tsv(.x, show_col_types = FALSE) %>%
+          dplyr::select(
+            protein = `Protein ID`,
+            entry_name = `Entry Name`,
+            gene = Gene,
+            protein_description = `Protein Description`
+          ) %>%
+          distinct()
+      }, error = function(e) {
+        message("Warning: Could not read ", .x, " - ", e$message)
+        return(tibble())
+      })
+    }) %>%
+    distinct() %>%
+    # Clean up gene names and create final mapping
+    mutate(
+      gene = case_when(
+        !is.na(gene) & gene != "" ~ gene,
+        !is.na(entry_name) & entry_name != "" ~ entry_name,
+        TRUE ~ protein
+      )
+    ) %>%
+    dplyr::select(protein, gene, entry_name, protein_description) %>%
+    distinct()
+    message("Extracted protein-to-gene mapping for ", nrow(prot2gene), " proteins")
+
+  } else {
+
+    message("No PSM files found. Using protein IDs as gene names.")
+    prot2gene <- df_from_search %>%
+      dplyr::select(protein) %>%
+      distinct() %>%
+      mutate(gene = protein) %>%
+    dplyr::select(protein, gene, entry_name, protein_description) %>%
+    distinct()
+  }
+
+} else {
+
+  # For other search engines, create basic mapping from available data
+  prot2gene <- df_from_search %>%
+    dplyr::select(protein) %>%
+    distinct() %>%
+    mutate(gene = protein) %>%  # Fallback: use protein ID as gene name
+    dplyr::select(protein, gene, entry_name, protein_description) %>%
+    distinct()
+  
+  message("Using protein IDs as gene names. Consider adding gene mapping for better annotation.")
+}
+```
+
+```{r annotate_peptides}
+#| cache: true
+# Annotate neo-termini
+rds_path_annotated <- file.path(rds_dir, "annotated_data.rds")
+
+if (file.exists(rds_path_annotated)) {
+
+  message("Loading cached annotated data...")
+  annotated_df_quant <- read_rds(rds_path_annotated)
+
+} else {
+  message("Annotating neo-termini...")
+
+  annotated_df_quant <- annotate_neo_termini(
+    peptides_df = df_from_search,
+    fasta_location = fasta_location,
+    sense = sense_protease,
+    specificity = specificity_protease,
+    organism = organism_annotation
+  ) %>% 
+    mutate(cleav_len = nchar(cleavage_sequence)) %>% 
+    relocate(cleav_len, .after = cleavage_sequence)
+  
+  # Add TargetP annotation if available
+  if (is.null(targetp_location)) {
+    message("TargetP annotation not defined")
+  } else {
+    message("TargetP annotation defined. Loading")
+    
+    annotated_df_quant <- annotated_df_quant %>%
+  left_join(., targetp_annotation_df) %>%
+  relocate(
+    cleav_len,
+    .after = cleavage_sequence
+  ) %>%
+  mutate(
+    targetp_matches_p1_prime = case_when(
+      abs(as.numeric(p1_position) - targetp_p1_position) < 4 ~ TRUE,
+        TRUE ~ FALSE
+    )
+  ) %>%
+  mutate(
+    processing_type_targetp = case_when(
+      targetp_matches_p1_prime == TRUE & targetp_category == "SP" ~ "SIGNAL",
+      targetp_matches_p1_prime == TRUE & targetp_category == "mTP" ~ "mTP",
+      targetp_matches_p1_prime == TRUE & targetp_category == "cTP" ~ "cTP",
+      targetp_matches_p1_prime == TRUE & targetp_category == "luTP" ~ "luTP",
+      targetp_matches_p1_prime == FALSE ~ "not_canonical",
+      is.na(targetp_matches_p1_prime) ~ "not_canonical",
+      TRUE ~ "not_canonical"
+    )) %>%
+  mutate(
+    processing_type_terminer = case_when(
+      (uniprot_processing_type == processing_type_targetp) & (uniprot_processing_type == "not_canonical") ~ processing_type_targetp,
+      (uniprot_processing_type == processing_type_targetp) & (processing_type_targetp == "not_canonical") ~ uniprot_processing_type,
+      (uniprot_processing_type == processing_type_targetp) & (uniprot_processing_type == "not_canonical_no_procc_annot") ~ uniprot_processing_type,
+      (uniprot_processing_type != processing_type_targetp) &  (uniprot_processing_type == "not_canonical") ~ processing_type_targetp,
+      (uniprot_processing_type != processing_type_targetp) &  (processing_type_targetp == "not_canonical") ~ uniprot_processing_type,
+      (uniprot_processing_type != processing_type_targetp) &  (uniprot_processing_type == "not_canonical_no_procc_annot") ~ processing_type_targetp,
+      (uniprot_processing_type != processing_type_targetp) &  (uniprot_processing_type != "not_canonical") ~ processing_type_targetp,
+      (uniprot_processing_type != processing_type_targetp) &  (uniprot_processing_type != "not_canonical_no_procc_annot") ~ processing_type_targetp,
+      (uniprot_processing_type != processing_type_targetp) &  (processing_type_targetp != "not_canonical") ~ processing_type_targetp,
+      TRUE ~ "not_canonical"
+    )
+  ) %>%
+  mutate(
+    source_processing_annotation = case_when(
+      (uniprot_processing_type == processing_type_targetp) & (uniprot_processing_type == "not_canonical") ~ "Other",
+      (uniprot_processing_type == processing_type_targetp) & (processing_type_targetp == "not_canonical") ~ "Other",
+      (uniprot_processing_type == processing_type_targetp) & (uniprot_processing_type == "not_canonical_no_procc_annot") ~ "Other",
+      (uniprot_processing_type != processing_type_targetp) &  (uniprot_processing_type == "not_canonical") ~ "TargetP",
+      (uniprot_processing_type != processing_type_targetp) &  (processing_type_targetp == "not_canonical") ~ "Uniprot",
+      (uniprot_processing_type != processing_type_targetp) &  (uniprot_processing_type == "not_canonical_no_procc_annot") ~ "Other",
+      (uniprot_processing_type != processing_type_targetp) &  (uniprot_processing_type != "not_canonical") ~ "Conflict/both",
+      (uniprot_processing_type != processing_type_targetp) &  (uniprot_processing_type != "not_canonical_no_procc_annot") ~ "Conflict/both",
+      (uniprot_processing_type != processing_type_targetp) &  (processing_type_targetp != "not_canonical") ~ "Conflict/both",
+      TRUE ~ "not_canonical"
+    )
+  ) %>%
+  mutate(
+    source_processing_annotation = case_when(
+      str_detect(processing_type_terminer, "not_canonical") ~ "Other", 
+      TRUE ~ source_processing_annotation
+    )) %>%
+  mutate(
+    processing_type = case_when(
+      str_detect(processing_type_terminer, "INIT_MET") ~ "P2",
+      processing_type_terminer == "Intact_ORF" ~ "P1",
+      processing_type_terminer == "mTP" ~ "MTS", 
+      processing_type_terminer == "SIGNAL" ~ "SP",
+      processing_type_terminer == "not_canonical_no_procc_annot" ~ "not_canonical",
+      TRUE ~ processing_type_terminer
+    )
+  ) %>%
+  mutate(
+    difference = case_when(
+      targetp_matches_p1_prime == TRUE ~ p1_position - targetp_p1_position,
+      matches_p1_prime == TRUE & targetp_matches_p1_prime == FALSE ~ p1_position - processing_annotation_end,
+    )
+  ) %>%
+  mutate(
+    processing_type = factor(
+      processing_type,
+      levels = c("P1", "P2", "SP", "MTS", "cTP", "TRANSIT", "PROPEP", "not_canonical")
+    )
+  ) %>%
+  relocate(targetp_category,
+           targetp_p1_position,
+           targetp_matches_p1_prime,
+           processing_type_targetp,
+           processing_type_terminer,
+           processing_type,
+           source_processing_annotation,
+           .after = processing_annotation_end) 
+    
+    # Clean up
+    rm(targetp_annotation_df)
+    invisible(gc())
+    
+    message("Added TargetP annotations for ", sum(!is.na(annotated_df_quant$targetp_category)), " proteins")
+  }
+  
+  write_rds(annotated_df_quant, rds_path_annotated)
+}
+```
+
+# Identification Statistics
+
+```{r identification_stats}
+#| fig-width: !expr plot_width
+#| fig-height: !expr plot_height
+#| cache: true
+
+# Calculate identification statistics
+create_identification_plots <- function(data, experimental_design) {
+  # Number of identifications per sample
+  ids_per_sample <- data %>%
+    dplyr::select(starts_with(instrument)) %>%
+    pivot_longer(cols = starts_with(instrument), names_to = "sample", values_to = "value") %>%
+    group_by(sample) %>%
+    summarise(n_identifications = sum(!is.na(value)), .groups = 'drop') %>%
+    left_join(experimental_design, by = "sample")
+  
+  # Plot identifications by condition
+  p1 <- ids_per_sample %>%
+    ggplot(aes(x = sample, y = n_identifications, fill = condition)) +
+    geom_col(position = "dodge") +
+    geom_jitter(width = 0.2, alpha = 0.7) +
+    labs(title = "Number of Identifications by Condition",
+         x = "Condition", y = "Number of Identifications") +
+    theme_minimal()  +
+    theme(
+      legend.position = "none",
+      axis.text.x = element_text(angle = 90, hjust = 1),
+      )
+  
+  return(list(plot = p1, data = ids_per_sample))
+}
+
+id_results <- create_identification_plots(annotated_df_quant, experimental_design)
+
+print(id_results$plot)
+```
+
+# Median Identifications by Processing Type
+
+```{r median_ids_processing_type}
+#| fig-width: !expr plot_width
+#| fig-height: !expr plot_height
+#| cache: true
+
+# Calculate identifications by specificity and refined processing type (excluding specific peptides)
+ids_by_specificity_refined <- annotated_df_quant %>%
+  filter(specificity %in% c("semi_Cterm", "semi_Nterm")) %>%
+  dplyr::select(specificity, processing_type, starts_with(instrument)) %>%
+  pivot_longer(cols = starts_with(instrument),
+               names_to = "sample",
+               values_to = "value") %>%
+  group_by(specificity, processing_type, sample) %>%
+  summarise(n_identifications = sum(!is.na(value)), .groups = 'drop') %>%
+  left_join(experimental_design, by = "sample")
+
+# Calculate median identifications by refined processing type
+median_ids_refined_processing <- ids_by_specificity_refined %>%
+  group_by(specificity, processing_type, condition) %>%
+  summarise(
+    median_ids = median(n_identifications),
+    mean_ids = mean(n_identifications),
+    sd_ids = sd(n_identifications),
+    n_samples = n(),
+    .groups = 'drop'
+  )
+
+# Plot median identifications with facet_grid (horizontal bars)
+plot_median_refined <- median_ids_refined_processing %>%
+  ggplot(aes(x = median_ids, 
+             y = condition,
+             fill = condition)) +
+  geom_col() +
+  geom_errorbar(aes(xmin = median_ids - sd_ids, 
+                    xmax = median_ids + sd_ids),
+                width = 0.3, alpha = 0.7) +
+  geom_text(aes(label = round(median_ids, 0)), 
+            hjust = -0.1, vjust = -1, size = 3) +
+  facet_grid(processing_type ~ specificity, scales = "free_x") +
+  scale_x_continuous(expand = expansion(mult = c(0, 0.05))) +
+  labs(
+    title = "Median Number of Identifications by Refined Processing Type",
+    subtitle = "Semi-specific peptides only, grouped by specificity and processing type",
+    x = "Median number of identifications",
+    y = "Condition",
+    fill = "Condition"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.y = element_text(angle = 0, hjust = 1),
+    legend.position = "bottom",
+    strip.text = element_text(size = 9)
+  )
+
+print(plot_median_refined)
+
+# Display summary table
+knitr::kable(median_ids_refined_processing, 
+             caption = "Summary Statistics: Identifications by Refined Processing Type and Condition",
+             digits = 1) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"))
+```
+
+# Missing Values Analysis
+
+```{r missing_values}
+#| fig-width: !expr plot_width
+#| fig-height: !expr plot_height
+#| cache: true
+
+# Analyze missing value patterns
+missing_analysis <- annotated_df_quant %>%
+  dplyr::select(starts_with(instrument)) %>%
+  vis_miss() +
+  labs(title = "Missing Value Patterns")
+
+print(missing_analysis)
+
+# Calculate missing value statistics
+missing_stats <- annotated_df_quant %>%
+  dplyr::select(starts_with(instrument)) %>%
+  summarise_all(~sum(is.na(.))) %>%
+  pivot_longer(everything(), names_to = "sample", values_to = "missing_count") %>%
+  left_join(experimental_design, by = "sample")
+
+missing_plot <- missing_stats %>%
+  ggplot(aes(x = sample, y = missing_count, fill = condition)) +
+  geom_col() +
+  labs(title = "Missing Values by Sample", x = "Sample", y = "Missing Count") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+print(missing_plot)
+```
+
+# Imputation and Data Preparation
+
+```{r imputation}
+#| cache: true
+
+# Prepare data for imputation
+rds_path_imputed <- file.path(rds_dir, "imputed_data.rds")
+
+if (file.exists(rds_path_imputed)) {
+  message("Loading cached imputed data...")
+  se_pept_imp_raw <- read_rds(rds_path_imputed)
+} else {
+  message("Performing imputation...")
+  
+  # Create SummarizedExperiment object
+  quant_matrix <- annotated_df_quant %>%
+    dplyr::select(nterm_modif_peptide, starts_with(instrument)) %>%
+    column_to_rownames("nterm_modif_peptide") %>%
+    as.matrix()
+  
+  annotation_data <- annotated_df_quant %>%
+    dplyr::select(-starts_with(instrument))
+  
+  se_pept_imp_raw <- SummarizedExperiment(
+    assays = list(counts = quant_matrix),
+    colData = experimental_design,
+    rowData = annotation_data
+  )
+  
+  # Perform imputation
+  se_pept_imp_raw <- terminer_imputation(
+    se = se_pept_imp_raw,
+    min_fraction_condition = missing_accepted,
+    min_fraction_replicate = 0.5,
+    min_n_peptides = 1
+  )
+  
+  write_rds(se_pept_imp_raw, rds_path_imputed)
+}
+```
+
+# Principal Component Analysis
+
+```{r pca_analysis}
+#| fig-width: !expr plot_width
+#| fig-height: !expr plot_height
+#| cache: true
+
+# Perform PCA on imputed data
+perform_pca_analysis <- function(se_object, title_suffix = "") {
+  pca_matrix <- assay(se_object) %>% t() %>% na.omit()
+  
+  pca_result <- prcomp(pca_matrix, scale. = TRUE)
+  
+  pca_df <- data.frame(
+    sample = rownames(pca_result$x),
+    PC1 = pca_result$x[,1],
+    PC2 = pca_result$x[,2]
+  ) %>%
+    left_join(experimental_design, by = "sample")
+  
+  var_exp <- summary(pca_result)$importance[2,]
+  
+  pca_plot <- pca_df %>%
+    ggplot(aes(x = PC1, y = PC2, color = condition)) +
+    geom_point(size = 3) +
+    stat_ellipse(level = 0.68) +
+    labs(
+      title = paste("PCA Analysis", title_suffix),
+      x = paste("PC1 -", round(var_exp[1] * 100, 1), "% variance"),
+      y = paste("PC2 -", round(var_exp[2] * 100, 1), "% variance")
+    ) +
+    theme_minimal()
+  
+  return(list(plot = pca_plot, data = pca_df, variance = var_exp))
+}
+
+pca_results <- perform_pca_analysis(se_pept_imp_raw, "- All Features")
+print(pca_results$plot)
+```
+
+# Save Results for Downstream Analysis
+
+```{r save_results}
+#| cache: true
+
+# Save key objects for downstream analysis
+save_objects <- list(
+  annotated_df_quant = annotated_df_quant,
+  se_pept_imp_raw = se_pept_imp_raw,
+  experimental_design = experimental_design,
+  prot2gene = prot2gene,
+  parameters = list(
+    search_engine = search_engine,
+    sense_protease = sense_protease,
+    specificity_protease = specificity_protease,
+    organism_annotation = organism_annotation,
+    missing_accepted = missing_accepted,
+    pre_fix = pre_fix,
+    # Search engine specific parameters
+    ref_sample = if(search_engine == "fragpipe_tmt") ref_sample else NULL,
+    min_purity = if(search_engine == "fragpipe_tmt") min_purity else NULL,
+    proteotypic_only = if(search_engine %in% c("diann", "spectronaut")) proteotypic_only else NULL
+  )
+)
+
+write_rds(save_objects, file.path(rds_dir, "exploratory_results.rds"))
+
+message("Exploratory analysis complete. Results saved for downstream analysis.")
+```
+
+# Session Information
+
+```{r session_info}
+sessionInfo()
+```
+````
