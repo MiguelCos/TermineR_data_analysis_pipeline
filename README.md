@@ -350,9 +350,8 @@ defined_contrasts <- c(
 ### Troubleshooting by Search Engine
 
 #### DIA-NN Issues
-- **File format errors**: Ensure report files are in parquet or TSV format
 - **Column naming**: Check that sample names match experimental annotation
-- **Memory issues**: Use parquet format for large datasets
+- **Memory issues**: Make sure you have enough memory allocated for large datasets
 
 #### FragPipe TMT Issues
 - **Missing annotation files**: Ensure each mixture directory has annotation.txt
@@ -361,20 +360,17 @@ defined_contrasts <- c(
 
 #### FragPipe Label-Free Issues
 - **Run mapping**: Ensure run names in annotation match spectrum file names
-- **Intensity values**: Check for zero/missing intensity values
 
 #### FragPipe Heavy-Light Issues
 - **File format**: Ensure combined_modified_peptide_label_quant.tsv exists
 - **Label detection**: Verify heavy/light modifications are correctly detected
 
-#### Spectronaut Issues
-- **Export format**: Use standard Spectronaut TSV export format
-- **Column names**: Ensure standard Spectronaut column naming is maintained
-
 ### Getting Help
 - Check the TermineR documentation: [GitHub repository](https://github.com/MiguelCos/TermineR)
 - Ensure all required packages are installed and up to date
 - Verify input file formats match the specifications above
+- For specific search engine issues, refer to their respective documentation or forums
+- Report an issue on ther TermineR GitHub repository if you encounter problems not covered here.
 
 ## Citation
 
