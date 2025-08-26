@@ -20,7 +20,6 @@ execute:
   message: false
   cache: true
 ---
-
 # Setup and Load Results
 
 ```{r setup}
@@ -34,6 +33,11 @@ suppressPackageStartupMessages({
   library(RColorBrewer)
   library(ComplexHeatmap)
   library(mixOmics)
+  # Added for GO visualization
+  library(clusterProfiler)
+  library(org.Mm.eg.db)
+  # Added for cleavage utilities
+  library(TermineR)
 })
 
 # Set parameters
@@ -41,7 +45,7 @@ rds_dir <- here("rds")
 results_dir <- here("results")
 plot_width <- 12
 plot_height <- 8
-fc_threshold <- 2.5
+fc_threshold <- 1.2
 pval_threshold <- 0.05
 ```
 
@@ -56,6 +60,24 @@ experimental_design <- exploratory_results$experimental_design
 all_results <- limma_results$all_results
 params <- exploratory_results$parameters
 pre_fix <- params$pre_fix
+
+# New: SE with protein-normalized peptides plus lost ones, and the non-protein-normalized SE
+se_with_lost <- exploratory_results$se_pept_protnorm_with_lost
+se_non_protnorm <- exploratory_results$se_pept_non_protnorm
+lost_features <- exploratory_results$lost_features
+
+# Load GO enrichment results produced by the inferential analysis (if available)
+go_results_path <- file.path(rds_dir, "go_enrichment_results.rds")
+
+if (file.exists(go_results_path)) {
+
+  go_results_list <- read_rds(go_results_path)
+  
+  } else {
+    
+  go_results_list <- list()
+
+}
 ```
 
 # Volcano Plots
@@ -65,23 +87,70 @@ pre_fix <- params$pre_fix
 #| fig-height: !expr plot_height
 
 create_volcano_plot <- function(data, contrast_name) {
-  data %>%
-    filter(contrast == contrast_name) %>%
-    mutate(
-      regulation = case_when(
+  df <- data %>%
+    dplyr::filter(contrast == contrast_name) %>%
+    dplyr::mutate(
+      regulation = dplyr::case_when(
         adj.P.Val < pval_threshold & logFC > log2(fc_threshold) ~ "upregulated",
         adj.P.Val < pval_threshold & logFC < -log2(fc_threshold) ~ "downregulated",
         TRUE ~ "not_significant"
       ),
       neg_log10_pval = -log10(adj.P.Val)
     ) %>%
-    ggplot(aes(x = logFC, y = neg_log10_pval, color = regulation)) +
-    geom_point(alpha = 0.6) +
-    scale_color_manual(values = c(
-      "upregulated" = "red",
-      "downregulated" = "blue",
-      "not_significant" = "gray"
-    )) +
+    dplyr::mutate(
+      processing_type = factor(
+        processing_type,
+        levels = c("P1", "P2", "SP", "MTS", "cTP", "TRANSIT", "PROPEP", "not_canonical")
+      )
+    )
+
+  n_up <- sum(df$regulation == "upregulated", na.rm = TRUE)
+  n_down <- sum(df$regulation == "downregulated", na.rm = TRUE)
+  n_sig <- n_up + n_down
+  cap <- paste0(
+    "DA features (|log2FC| > ", round(log2(fc_threshold), 3), ", FDR < ", pval_threshold, "): ",
+    n_sig, " (up ", n_up, ", down ", n_down, ")"
+  )
+
+  # Classify peptide specificity
+  df <- df %>% dplyr::mutate(
+    is_semi = stringr::str_detect(dplyr::coalesce(specificity, ""), "^semi"),
+    is_specific = dplyr::coalesce(specificity, "") == "specific"
+  )
+
+  # Grey points: all non-DA OR specific peptides (regardless of DA)
+  df_grey <- df %>% dplyr::filter(!(regulation != "not_significant" & is_semi))
+
+  # Colored points: only DA and semi-specific
+  df_color <- df %>% dplyr::filter(regulation != "not_significant", is_semi)
+
+  ggplot() +
+    # Grey: non-significant and all specific peptides
+    geom_point(
+      data = df_grey,
+      aes(x = logFC, y = neg_log10_pval),
+      color = "gray70",
+      alpha = 0.5
+    ) +
+    # Colored: DA semi-specific peptides by processing_type
+    geom_point(
+      data = df_color,
+      aes(x = logFC, y = neg_log10_pval, color = processing_type),
+      alpha = 1
+    ) +
+    scale_color_manual(
+      name = "Processing type",
+      values = c(
+        "P1" = "#041e42",
+        "P2" = "#b2cae4",
+        "SP" = "#fbf2c4",
+        "MTS" = "#bab49e",
+        "cTP" = "#b26801",
+        "TRANSIT" = "#008080",
+        "PROPEP" = "#d4af37",
+        "not_canonical" = "#ff7f50"
+      )
+    ) +
     geom_vline(xintercept = c(-log2(fc_threshold), log2(fc_threshold)), 
                linetype = "dashed", alpha = 0.5) +
     geom_hline(yintercept = -log10(pval_threshold), 
@@ -89,63 +158,22 @@ create_volcano_plot <- function(data, contrast_name) {
     labs(
       title = paste("Volcano Plot -", contrast_name),
       x = "Log2 Fold Change",
-      y = "-Log10 Adjusted P-value"
+      y = "-Log10 Adjusted P-value",
+      caption = cap
     ) +
-    theme_minimal()
+    theme_minimal() +
+    theme(plot.caption = element_text(hjust = 0))
 }
 
 # Create volcano plots for each contrast
 contrast_names <- unique(all_results$contrast)
-volcano_plots <- map(contrast_names, ~create_volcano_plot(all_results, .x))
+
+volcano_plots <- purrr::map(contrast_names, ~create_volcano_plot(all_results, .x))
+
 names(volcano_plots) <- contrast_names
 
 # Display plots
-walk(volcano_plots, print)
-```
-
-# Heatmaps
-
-```{r heatmaps}
-#| fig-width: !expr plot_width
-#| fig-height: !expr plot_height
-
-# Create heatmap of significantly regulated features
-create_regulation_heatmap <- function(results_data, top_n = 50) {
-  # Get top regulated features
-  top_features <- results_data %>%
-    filter(adj.P.Val < pval_threshold) %>%
-    arrange(adj.P.Val) %>%
-    slice_head(n = top_n)
-  
-  if (nrow(top_features) == 0) {
-    message("No significantly regulated features found for heatmap.")
-    return(NULL)
-  }
-  
-  # Create matrix for heatmap
-  heatmap_matrix <- top_features %>%
-    select(nterm_modif_peptide, contrast, logFC) %>%
-    pivot_wider(names_from = contrast, values_from = logFC, values_fill = 0) %>%
-    column_to_rownames("nterm_modif_peptide") %>%
-    as.matrix()
-  
-  # Create heatmap
-  pheatmap(
-    heatmap_matrix,
-    scale = "none",
-    clustering_distance_rows = "correlation",
-    clustering_distance_cols = "correlation",
-    color = colorRampPalette(c("blue", "white", "red"))(100),
-    main = paste("Top", top_n, "Regulated Features"),
-    fontsize_row = 8,
-    fontsize_col = 10
-  )
-}
-
-regulation_heatmap <- create_regulation_heatmap(all_results)
-if (!is.null(regulation_heatmap)) {
-  print(regulation_heatmap)
-}
+purrr::walk(volcano_plots, print)
 ```
 
 # Summary Statistics
@@ -153,7 +181,14 @@ if (!is.null(regulation_heatmap)) {
 ```{r summary_stats}
 # Generate summary statistics
 summary_stats <- all_results %>%
-  group_by(contrast) %>%
+  dplyr::mutate(
+    normalization = case_when(
+      dataset == "non_protnorm" ~ "Non Protein-Normalized",
+      dataset == "protnorm_with_lost" ~ "Protein-Normalized",
+      TRUE ~ "Unknown"
+    )
+  ) %>%
+  group_by(contrast, normalization, specificity, processing_type) %>%
   summarise(
     total_features = n(),
     upregulated = sum(adj.P.Val < pval_threshold & logFC > log2(fc_threshold)),
@@ -163,6 +198,588 @@ summary_stats <- all_results %>%
   )
 
 knitr::kable(summary_stats, caption = "Summary of Differential Analysis Results")
+```
+
+# Proportional Abundances Analysis
+
+```{r proportional_abundances}
+#| fig-width: 12
+#| fig-height: 5
+
+get_linear_assay <- function(se) {
+  mat <- SummarizedExperiment::assay(se)
+  # Heuristic: if values look like log2 scale, back-transform
+  mx <- suppressWarnings(max(mat, na.rm = TRUE))
+  if (is.finite(mx) && mx < 50) 2^mat else mat
+}
+
+if (!is.null(se_with_lost)) {
+
+  mat_lin <- get_linear_assay(se_with_lost)
+
+  rd <- as.data.frame(rowData(se_with_lost))
+
+  semi_idx <- stringr::str_detect(dplyr::coalesce(rd$specificity, ""), "^semi")
+
+  semi_sum <- colSums(mat_lin[semi_idx, , drop = FALSE], na.rm = TRUE)
+
+  total_sum <- colSums(mat_lin, na.rm = TRUE)
+
+  prop_df <- tibble(
+    sample = colnames(mat_lin),
+    `percent_semi_over_total` = 100 * semi_sum / pmax(total_sum, .Machine$double.eps)
+  ) %>%
+    left_join(experimental_design, by = "sample") 
+
+  # Boxplot with jitter (line plot removed by request)
+  plot_box <- ggplot(
+    prop_df,
+    aes(
+      x = condition,
+      y = `percent_semi_over_total`,
+      fill = condition
+    )
+  ) +
+    geom_boxplot(outlier.alpha = 0.3) +
+    geom_jitter(alpha = 0.5, width = 0.2, size = 1) +
+    labs(
+      x = "Condition",
+      y = "% Abundance of proteolytic products",
+      title = "Proportional abundances of proteolytic products - Distribution"
+    ) +
+    theme_minimal() +
+    theme(legend.position = "bottom")
+
+  print(plot_box)
+
+} else {
+
+  message("se_with_lost not available; skipping proportional abundance plots.")
+
+}
+```
+
+# Principal Component Analysis
+
+```{r pca_analysis}
+#| fig-width: 14
+#| fig-height: 7
+
+perform_pca_plot_from_se <- function(se, title_text) {
+
+  if (is.null(se)) return(invisible(NULL))
+
+  mat <- SummarizedExperiment::assay(se)
+
+  # remove features with zero variance
+  keep <- apply(mat, 1, function(x) sd(x, na.rm = TRUE) > 0)
+
+  mat <- mat[keep, , drop = FALSE]
+
+  if (ncol(mat) < 2 || nrow(mat) < 2) return(invisible(NULL))
+
+  X <- t(mat)
+
+  pca_res <- mixOmics::pca(X, ncomp = 2, scale = TRUE)
+
+  scores <- as.data.frame(pca_res$x[, 1:2])
+
+  colnames(scores) <- c("PC1", "PC2")
+
+  scores$sample <- rownames(pca_res$x)
+
+  pca_df <- scores %>% dplyr::left_join(experimental_design, by = "sample")
+
+  var1 <- round(pca_res$prop_expl_var$X[1] * 100, 1)
+  var2 <- round(pca_res$prop_expl_var$X[2] * 100, 1)
+
+  ggplot(pca_df, aes(x = PC1, y = PC2, color = condition)) +
+    geom_point(size = 3, alpha = 0.9) +
+    labs(title = title_text,
+         subtitle = paste0("PC1: ", var1, "%, PC2: ", var2, "%")) +
+    theme_minimal() +
+    theme(legend.position = "bottom")
+}
+
+pca_non_prot <- perform_pca_plot_from_se(
+  se_non_protnorm, 
+  "PCA: Non protein-normalized peptides")
+
+pca_prot_with_lost <- perform_pca_plot_from_se(
+  se_with_lost, 
+  "PCA: Protein-normalized")
+
+ggarrange(pca_non_prot, pca_prot_with_lost, ncol = 2, common.legend = TRUE, legend = "bottom")
+```
+
+# PCA by specificity (semi_Cterm vs semi_Nterm)
+
+```{r pca_by_specificity}
+#| fig-width: 14
+#| fig-height: 14
+
+filter_se_by_specificity <- function(se, pattern) {
+  if (is.null(se)) return(se)
+  rd <- as.data.frame(rowData(se))
+  idx <- stringr::str_detect(dplyr::coalesce(rd$specificity, ""), pattern)
+  se[idx, , drop = FALSE]
+}
+
+p1 <- perform_pca_plot_from_se(
+  filter_se_by_specificity(
+    se_with_lost,
+    "^semi_Cterm$"
+  ),
+  "PCA: protnorm semi_Cterm"
+)
+
+p2 <- perform_pca_plot_from_se(
+  filter_se_by_specificity(
+    se_with_lost,
+    "^semi_Nterm$"
+  ),
+  "PCA: protnorm semi_Nterm"
+)
+
+p3 <- perform_pca_plot_from_se(
+  filter_se_by_specificity(
+    se_non_protnorm,
+    "^semi_Cterm$"
+  ),
+  "PCA: non-protnorm semi_Cterm"
+)
+
+p4 <- perform_pca_plot_from_se(
+  filter_se_by_specificity(
+    se_non_protnorm,
+    "^semi_Nterm$"
+  ),
+  "PCA: non-protnorm semi_Nterm"
+)
+
+ggarrange(p1, p2, p3, p4, ncol = 2, nrow = 2, common.legend = TRUE, legend = "bottom")
+```
+
+# Intersection Analysis: Before vs After Protein Normalization
+
+```{r intersection_analysis}
+#| fig-width: 10
+#| fig-height: 4
+
+if (!is.null(all_results) && all(c("dataset", "contrast", "nterm_modif_peptide", "logFC", "adj.P.Val") %in% names(all_results))) {
+  contrasts <- unique(all_results$contrast)
+
+  make_sets <- function(contrast_name, direction = c("up", "down")) {
+    direction <- match.arg(direction)
+    df <- all_results %>% dplyr::filter(contrast == contrast_name)
+
+    if (direction == "up") {
+      before <- df %>% dplyr::filter(
+        dataset == "non_protnorm",
+        adj.P.Val < pval_threshold,
+        logFC > log2(fc_threshold)
+      )
+      after <- df %>% dplyr::filter(
+        dataset == "protnorm_with_lost",
+        adj.P.Val < pval_threshold,
+        logFC > log2(fc_threshold)
+      )
+    } else {
+      before <- df %>% dplyr::filter(
+        dataset == "non_protnorm",
+        adj.P.Val < pval_threshold,
+        logFC < -log2(fc_threshold)
+      )
+      after <- df %>% dplyr::filter(
+        dataset == "protnorm_with_lost",
+        adj.P.Val < pval_threshold,
+        logFC < -log2(fc_threshold)
+      )
+    }
+
+    list(
+      Before = unique(before$nterm_modif_peptide),
+      After = unique(after$nterm_modif_peptide)
+    )
+  }
+
+  for (cn in contrasts) {
+    # Upregulated
+    sets_up <- make_sets(cn, "up")
+    comb_up <- ComplexHeatmap::make_comb_mat(sets_up)
+    ta_up <- ComplexHeatmap::upset_top_annotation(comb_up, add_numbers = TRUE)
+    ra_up <- ComplexHeatmap::upset_right_annotation(comb_up, add_numbers = TRUE)
+    print(ComplexHeatmap::UpSet(
+      comb_up,
+      set_order = c("Before", "After"),
+      column_title = paste0("Upregulated - ", cn),
+      top_annotation = ta_up,
+      right_annotation = ra_up
+    ))
+
+    # Downregulated
+    sets_down <- make_sets(cn, "down")
+    comb_down <- ComplexHeatmap::make_comb_mat(sets_down)
+    ta_down <- ComplexHeatmap::upset_top_annotation(comb_down, add_numbers = TRUE)
+    ra_down <- ComplexHeatmap::upset_right_annotation(comb_down, add_numbers = TRUE)
+    print(ComplexHeatmap::UpSet(
+      comb_down,
+      set_order = c("Before", "After"),
+      column_title = paste0("Downregulated - ", cn),
+      top_annotation = ta_down,
+      right_annotation = ra_down
+    ))
+  }
+} else {
+  message("Required columns for intersection analysis not found; skipping.")
+}
+```
+
+# Cleavage Pattern Analysis
+
+## Prepare Data for Cleavage Analysis
+
+```{r cleavage_data_prep}
+required_cols <- c(
+  "processing_type", "specificity", "x_res_before", "x_res_after",
+  "dataset", "contrast", "adj.P.Val", "logFC"
+)
+
+cleavage_available <- all(required_cols %in% names(all_results))
+
+if (cleavage_available) {
+  # Significant, non-canonical, protein-normalized, semi-specific features across all contrasts
+  fc_thr <- log2(fc_threshold)
+
+  diffabund_features <- all_results %>%
+    dplyr::filter(
+      dataset == "protnorm_with_lost",
+      processing_type == "not_canonical",
+      adj.P.Val < pval_threshold
+    ) %>%
+    dplyr::mutate(
+      is_semi = stringr::str_detect(dplyr::coalesce(specificity, ""), "^semi"),
+      cleavage_sequence_x = paste0(x_res_before, x_res_after)
+    ) %>%
+    dplyr::filter(is_semi)
+
+  # Split by contrast and, for each contrast, return a list with two character vectors:
+  #   - upregulated: cleavage P1-P1' sequences with logFC > fc_thr
+  #   - downregulated: cleavage P1-P1' sequences with logFC < -fc_thr
+  cleavage_sets_by_contrast <- diffabund_features %>%
+    split(.$contrast) %>%
+    purrr::imap(function(df, cn) {
+      up_vec <- df %>%
+        dplyr::filter(logFC > fc_thr) %>%
+        dplyr::pull(cleavage_sequence_x) %>%
+        stats::na.omit() %>%
+        unique() %>%
+        as.character()
+
+      down_vec <- df %>%
+        dplyr::filter(logFC < -fc_thr) %>%
+        dplyr::pull(cleavage_sequence_x) %>%
+        stats::na.omit() %>%
+        unique() %>%
+        as.character()
+
+      list(
+        upregulated = up_vec,
+        downregulated = down_vec
+      )
+    })
+
+} else {
+
+  message("Cleavage annotations not found in results; skipping cleavage analyses.")
+
+}
+```
+
+## Diagnostics: cleavage heatmap input vs DA counts
+
+```{r cleavage_diagnostics}
+# Provide a per-contrast diagnostic to explain differences between DA counts and heatmap inputs
+if (all(c("dataset", "contrast", "adj.P.Val", "logFC", "processing_type", "specificity", "x_res_before", "x_res_after") %in% names(all_results))) {
+
+  fc_thr <- log2(fc_threshold)
+
+  protnorm_sig <- all_results %>%
+    dplyr::filter(
+      dataset == "protnorm_with_lost",
+      adj.P.Val < pval_threshold
+    ) %>%
+    dplyr::mutate(
+      has_cleavage_pos = !is.na(x_res_before) & !is.na(x_res_after),
+      is_non_canonical = processing_type == "not_canonical",
+      is_semi = stringr::str_detect(dplyr::coalesce(specificity, ""), "^semi"),
+      cleavage_sequence_x = paste0(x_res_before, x_res_after),
+      direction = dplyr::case_when(
+        logFC > fc_thr ~ "upregulated",
+        logFC < -fc_thr ~ "downregulated",
+        TRUE ~ "not_counted"
+      )
+    ) %>%
+    dplyr::filter(direction != "not_counted")
+
+  diag_tbl <- protnorm_sig %>%
+    dplyr::group_by(contrast, direction) %>%
+    dplyr::summarise(
+      da_total = dplyr::n(),
+      with_cleavage_positions = sum(has_cleavage_pos, na.rm = TRUE),
+      after_non_canonical = sum(has_cleavage_pos & is_non_canonical, na.rm = TRUE),
+      semi_specific = sum(has_cleavage_pos & is_non_canonical & is_semi, na.rm = TRUE),
+      unique_sequences = dplyr::n_distinct(cleavage_sequence_x[has_cleavage_pos & is_non_canonical & is_semi]),
+      .groups = "drop"
+    ) %>%
+    dplyr::arrange(contrast, direction)
+
+  knitr::kable(diag_tbl, caption = "Diagnostics: DA vs cleavage heatmap inputs (protein-normalized)")
+
+} else {
+
+  message("Required columns for cleavage diagnostics not found; skipping.")
+
+}
+```
+
+## Cleavage Pattern Heatmaps
+
+```{r cleavage_heatmaps}
+#| fig-width: 6
+#| fig-height: 4
+
+if (isTRUE(cleavage_available) && requireNamespace("TermineR", quietly = TRUE)) {
+
+  # Plot a cleavage heatmap for a vector of cleavage-area sequences
+  plot_cleavage_heatmap <- function(seqs, title_text, p_num = 10, min_n = 1) {
+
+    seqs <- seqs[!is.na(seqs)]
+    if (!length(seqs) || length(seqs) < min_n) return(invisible(NULL))
+
+    # Adjust p_number to sequence lengths (supports simple P1-P1' pairs too)
+    max_len <- suppressWarnings(max(nchar(seqs), na.rm = TRUE))
+    p_use <- max(1L, min(p_num, floor(max_len / 2)))
+
+    cam <- tryCatch(
+      TermineR::cleavage_area_matrix(seqs, p_number = p_use),
+      error = function(e) NULL
+    )
+
+    if (!is.null(cam) && !is.null(cam$amino_acid_count)) {
+      pheatmap(
+        cam$amino_acid_count,
+        main = title_text,
+        cluster_rows = FALSE,
+        cluster_cols = FALSE
+      )
+    }
+  }
+
+  # Recursively plot heatmaps for each contrast and direction
+  if (exists("cleavage_sets_by_contrast") && length(cleavage_sets_by_contrast)) {
+
+    for (cn in names(cleavage_sets_by_contrast)) {
+
+      message("Plotting cleavage heatmaps for contrast: ", cn)
+
+      dirs <- cleavage_sets_by_contrast[[cn]]
+      for (dir_name in c("upregulated", "downregulated")) {
+
+        seqs <- dirs[[dir_name]]
+        nr_seqs <- length(seqs)
+
+        if (!is.null(seqs) && length(seqs)) {
+          plot_cleavage_heatmap(
+            seqs,
+            paste0(
+              "Cleavage heatmap: ", dir_name,
+              " (semi N+C) — ", cn,
+              " (", nr_seqs, " sequences)"
+            ),
+            p_num = 10,
+            min_n = 1
+          )
+        }
+
+      }
+    }
+  } else {
+    message("cleavage_sets_by_contrast not available or empty; skipping cleavage heatmaps.")
+  }
+
+} else if (isTRUE(cleavage_available)) {
+  message("TermineR::cleavage_area_matrix not available; skipping cleavage heatmaps.")
+}
+```
+
+## Sequence Logos (dagLogo)
+
+```{r sequence_logos}
+#| fig-width: 8
+#| fig-height: 5
+
+# Use dagLogo to generate sequence logos around cleavage sites
+if (isTRUE(cleavage_available) && requireNamespace("dagLogo", quietly = TRUE)) {
+  
+  # Try to locate fasta_location from cache, else fallback to the known mouse FASTA
+  fasta_rds <- file.path(rds_dir, "fasta_location.rds")
+
+  if (file.exists(fasta_rds)) {
+
+    fasta_location <- read_rds(fasta_rds)
+
+  } else {
+
+    fasta_location <- here("data/ebi_mus_musculus_canonical_proteome_1gene_1protein_2023_03_release_plus_irts.fasta")
+    message("Using fallback FASTA location: ", fasta_location)
+  }
+
+  if (is.character(fasta_location) && file.exists(fasta_location)) {
+    # Prepare proteome reference
+    proteome <- dagLogo::prepareProteome(fasta = fasta_location, species = "Mus musculus")
+
+    # Function to generate dagLogo if sufficient sequences
+    generate_daglogo <- function(sequences, title_text, min_seq = 5) {
+
+      if (length(sequences) >= min_seq) {
+        set.seed(404)
+        seqs_4ice <- dagLogo::formatSequence(seq = sequences, proteome = proteome)
+        seqs_4ice_bg <- dagLogo::buildBackgroundModel(
+          seqs_4ice,
+          model = "any",
+          background = "wholeProteome",
+          proteome = proteome,
+          testType = "ztest"
+        )
+        seqs_4ice_dau <- dagLogo::testDAU(seqs_4ice, dagBackground = seqs_4ice_bg)
+        # Return the ggplot produced by dagLogo; knitr will print it
+        dagLogo::dagLogo(
+          seqs_4ice_dau,
+          labels = c("P10", "P9", "P8", "P7", "P6", "P5", "P4", "P3", "P2", "P1",
+                     "P1'", "P2'", "P3'", "P4'", "P5'", "P6'", "P7'", "P8'", "P9'", "P10'")
+        )
+      } else {
+
+        # Fallback plot when sequence count is insufficient
+        plot.new()
+
+        text(0.5, 0.5, paste0(title_text, "\nInsufficient sequences (n=", length(sequences), ")"),
+             cex = 1.2, adj = 0.5)
+
+        invisible(NULL)
+      }
+    }
+
+    # Render logos using the same sequence sets used for heatmaps, per contrast and direction
+    if (exists("cleavage_sets_by_contrast") && length(cleavage_sets_by_contrast)) {
+
+      for (cn in names(cleavage_sets_by_contrast)) {
+
+        dirs <- cleavage_sets_by_contrast[[cn]]
+
+        for (dir_name in c("upregulated", "downregulated")) {
+
+          seqs <- dirs[[dir_name]]
+          nr_seqs <- length(seqs)
+          if (!is.null(seqs) && nr_seqs > 0) {
+            print(
+              generate_daglogo(
+                seqs,
+                paste0("dagLogo: ", dir_name, " — ", cn, " (", nr_seqs, " sequences)")
+              )
+            )
+          }
+
+        }
+      }
+    } else {
+
+      message("cleavage_sets_by_contrast not available or empty; skipping dagLogo sequence logos.")
+
+    }
+
+  } else {
+    message("FASTA file for dagLogo not found; skipping sequence logos.")
+  }
+
+} else if (isTRUE(cleavage_available)) {
+  message("Package dagLogo not installed; skipping sequence logos.")
+}
+```
+
+# Histogram of Cleavage Positions
+
+```{r cleavage_positions}
+# Prepare data for cleavage position analysis
+upregulated_features_pos <- all_results %>%
+  filter(
+    contrast == "Tumor_vs_NAT",
+    regulation == "upregulated",
+    processing_type == "not_canonical"
+  ) %>%
+  mutate(
+    m_in_p1_or_p1_prime = case_when(
+      str_detect(p1_residue, "M") | str_detect(p1_prime_residue, "M") ~ "M in P1 or P1'",
+      TRUE ~ "no M in P1 or P1'"
+    ),
+    normalized_cleavage_position = p1_prime_position / protein_length * 100
+  ) %>%
+  filter(!is.na(normalized_cleavage_position))
+```
+
+```{r cleavage_histogram}
+#| fig-width: 8
+#| fig-height: 7
+
+if (all(c("p1_prime_position", "protein_length", "dataset", "contrast") %in% names(all_results))) {
+
+  for (contrast in unique(all_results$contrast)) {
+
+    message("Plotting cleavage position histogram for contrast: ", contrast)
+
+  upregulated_features_pos <- all_results %>%
+    dplyr::filter(
+      dataset == "protnorm_with_lost",
+      contrast == contrast,
+      regulation != "not_significant",
+      processing_type == "not_canonical",
+      !is.na(p1_prime_position),
+      !is.na(protein_length),
+      protein_length > 0
+    ) %>%
+    dplyr::mutate(
+      normalized_cleavage_position = p1_prime_position / protein_length * 100,
+      m_in_p1_or_p1_prime = case_when(
+        str_detect(p1_residue, "M") | str_detect(p1_prime_residue, "M") ~ "M in P1 or P1'",
+        TRUE ~ "no M in P1 or P1'")
+      )
+
+    p <- ggplot(
+      upregulated_features_pos, 
+      aes(x = normalized_cleavage_position)) +
+      geom_histogram(bins = 50, fill = "steelblue", color = "black", alpha = 0.7) +
+      facet_grid(intra_or_extra ~ m_in_p1_or_p1_prime) +
+      labs(
+        title = "Histogram of Cleavage Site Positions",
+        subtitle = contrast,
+        x = "Normalized Cleavage Site Position (%)",
+        y = "Count"
+      ) +
+      theme_minimal() +
+      theme(
+        strip.text = element_text(size = 10),
+        plot.title = element_text(size = 14),
+        plot.subtitle = element_text(size = 12)
+      )
+
+  print(p)
+
+  }
+
+  } else {
+    message("Required columns for cleavage position histogram not found; skipping.")
+  }
 ```
 
 # Save Plots and Summary
@@ -177,7 +794,7 @@ write_tsv(
 message("Visualization analysis complete. Results saved.")
 ```
 
-# Session Information
+# Session Info
 
 ```{r session_info}
 sessionInfo()
