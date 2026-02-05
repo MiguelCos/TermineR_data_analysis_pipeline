@@ -35,30 +35,74 @@ suppressPackageStartupMessages({
   library(mixOmics)
   # Added for GO visualization
   library(clusterProfiler)
-  library(org.Mm.eg.db)
+  library(org.Hs.eg.db)
   # Added for cleavage utilities
   library(TermineR)
+  # Added for sequence logos
+  library(dagLogo)
+  library(SummarizedExperiment)
 })
+
+# Avoid lazy-load cache buffer issues in large objects
+knitr::opts_chunk$set(cache.lazy = FALSE)
 
 # Set parameters
 rds_dir <- here("rds")
 results_dir <- here("results")
 plot_width <- 12
 plot_height <- 8
+# EXPERIMENT-SPECIFIC: update thresholds for your study.
 fc_threshold <- 1.2
 pval_threshold <- 0.05
+
+# EXPERIMENT-SPECIFIC: update prefix used for inputs/outputs from other scripts.
+pre_fix <- "xx000_projectname_analysis_type"
+
+# EXPERIMENT-SPECIFIC: set protein annotation path (Uniprot TSV table of the proteome used for the search).
+protein_annotation_path <- "Z:/0_people/mcosenza/fastas_and_organims_annotations/org_annotations/human/uniprotkb_proteome_UP000005640_AND_mode_2025_08_13.tsv"
+
+# EXPERIMENT-SPECIFIC: select normalization dataset(s) of interest.
+# Options available in this notebook environment: "protnorm_pure", "protnorm_with_lost", "non_protnorm", "protein_abund_norm" refers to protein-level analysis
+dataset_of_interest <- c("protnorm_with_lost", "non_protnorm", "protein_abund_norm")
+
+# EXPERIMENT-SPECIFIC: define condition levels in your experimental design.
+
+condition_levels <- c(
+  "NAT", 
+  "PC",
+  "Tumor"
+)
+
+# EXPERIMENT-SPECIFIC: define contrast levels matching your contrasts in inferential analysis.
+
+contrast_levels <- c(
+  "Tumor_v_NAT", 
+  "PC_v_NAT",
+  "Tumor_v_PC"
+)
+
+# EXPERIMENT-SPECIFIC: set sequence logo options (dagLogo).
+run_sequence_logos <- FALSE
+# Optional filters (NULL means all). Use names from `contrast_levels` and
+# detected values in volcano_data_after_w_go$nterm_modif.
+sequence_logo_contrasts <- NULL
+sequence_logo_nterm_modifs <- NULL
 ```
 
 ```{r load_data}
-#| cache: true
+#| cache: false
 # Load pre-computed results
-exploratory_results <- read_rds(file.path(rds_dir, "exploratory_results.rds"))
-limma_results <- read_rds(file.path(rds_dir, "limma_results.rds"))
+exploratory_results <- read_rds(file.path(rds_dir, paste0(pre_fix, "_exploratory_results.rds")))
+limma_results <- read_rds(file.path(rds_dir, paste0(pre_fix, "_limma_results.rds")))
 
 # Extract key objects
 experimental_design <- exploratory_results$experimental_design
-all_results <- limma_results$all_results
+
+all_results <- limma_results$all_results %>%
+  filter(dataset %in% dataset_of_interest)
+
 params <- exploratory_results$parameters
+
 pre_fix <- params$pre_fix
 
 # New: SE with protein-normalized peptides plus lost ones, and the non-protein-normalized SE
@@ -66,298 +110,677 @@ se_with_lost <- exploratory_results$se_pept_protnorm_with_lost
 se_non_protnorm <- exploratory_results$se_pept_non_protnorm
 lost_features <- exploratory_results$lost_features
 
+# protein to gene mapping
+prot2gene <- exploratory_results$prot2gene
+
 # Load GO enrichment results produced by the inferential analysis (if available)
-go_results_path <- file.path(rds_dir, "go_enrichment_results.rds")
+go_results_path <- file.path(rds_dir, paste0(pre_fix, "_go_enrichment_results.rds"))
 
 if (file.exists(go_results_path)) {
 
+  message("Loading pre-computed GO enrichment results...")
   go_results_list <- read_rds(go_results_path)
   
   } else {
-    
+  
+  message("No GO enrichment results found; skipping GO visualization.")
   go_results_list <- list()
 
 }
-```
 
-# Volcano Plots
+# load go grouping table
 
-```{r volcano_plots}
-#| fig-width: !expr plot_width
-#| fig-height: !expr plot_height
+go_groups_path <- file.path(here(rds_dir), paste0(pre_fix, "_go_cc_mapping.rds"))
 
-create_volcano_plot <- function(data, contrast_name) {
-  df <- data %>%
-    dplyr::filter(contrast == contrast_name) %>%
-    dplyr::mutate(
-      regulation = dplyr::case_when(
-        adj.P.Val < pval_threshold & logFC > log2(fc_threshold) ~ "upregulated",
-        adj.P.Val < pval_threshold & logFC < -log2(fc_threshold) ~ "downregulated",
-        TRUE ~ "not_significant"
-      ),
-      neg_log10_pval = -log10(adj.P.Val)
-    ) %>%
-    dplyr::mutate(
-      processing_type = factor(
-        processing_type,
-        levels = c("P1", "P2", "SP", "MTS", "cTP", "TRANSIT", "PROPEP", "not_canonical")
-      )
-    )
+if (file.exists(go_groups_path)) {
 
-  n_up <- sum(df$regulation == "upregulated", na.rm = TRUE)
-  n_down <- sum(df$regulation == "downregulated", na.rm = TRUE)
-  n_sig <- n_up + n_down
-  cap <- paste0(
-    "DA features (|log2FC| > ", round(log2(fc_threshold), 3), ", FDR < ", pval_threshold, "): ",
-    n_sig, " (up ", n_up, ", down ", n_down, ")"
-  )
+  message("Loading pre-computed GO grouping table...")
+  go_groups_df <- read_rds(go_groups_path)
+  
+  } else {
+  
+  message("No GO grouping table found; skipping GO grouping visualization.")
+  go_groups_df <- NULL
 
-  # Classify peptide specificity
-  df <- df %>% dplyr::mutate(
-    is_semi = stringr::str_detect(dplyr::coalesce(specificity, ""), "^semi"),
-    is_specific = dplyr::coalesce(specificity, "") == "specific"
-  )
-
-  # Grey points: all non-DA OR specific peptides (regardless of DA)
-  df_grey <- df %>% dplyr::filter(!(regulation != "not_significant" & is_semi))
-
-  # Colored points: only DA and semi-specific
-  df_color <- df %>% dplyr::filter(regulation != "not_significant", is_semi)
-
-  ggplot() +
-    # Grey: non-significant and all specific peptides
-    geom_point(
-      data = df_grey,
-      aes(x = logFC, y = neg_log10_pval),
-      color = "gray70",
-      alpha = 0.5
-    ) +
-    # Colored: DA semi-specific peptides by processing_type
-    geom_point(
-      data = df_color,
-      aes(x = logFC, y = neg_log10_pval, color = processing_type),
-      alpha = 1
-    ) +
-    scale_color_manual(
-      name = "Processing type",
-      values = c(
-        "P1" = "#041e42",
-        "P2" = "#b2cae4",
-        "SP" = "#fbf2c4",
-        "MTS" = "#bab49e",
-        "cTP" = "#b26801",
-        "TRANSIT" = "#008080",
-        "PROPEP" = "#d4af37",
-        "not_canonical" = "#ff7f50"
-      )
-    ) +
-    geom_vline(xintercept = c(-log2(fc_threshold), log2(fc_threshold)), 
-               linetype = "dashed", alpha = 0.5) +
-    geom_hline(yintercept = -log10(pval_threshold), 
-               linetype = "dashed", alpha = 0.5) +
-    labs(
-      title = paste("Volcano Plot -", contrast_name),
-      x = "Log2 Fold Change",
-      y = "-Log10 Adjusted P-value",
-      caption = cap
-    ) +
-    theme_minimal() +
-    theme(plot.caption = element_text(hjust = 0))
 }
-
-# Create volcano plots for each contrast
-contrast_names <- unique(all_results$contrast)
-
-volcano_plots <- purrr::map(contrast_names, ~create_volcano_plot(all_results, .x))
-
-names(volcano_plots) <- contrast_names
-
-# Display plots
-purrr::walk(volcano_plots, print)
 ```
 
-# Summary Statistics
+```{r}
+# protein annotation
+protein_annotation <- read_tsv(
+  protein_annotation_path
+) %>%
+  janitor::clean_names() %>%
+  dplyr::select(
+    protein = entry,
+    gene = gene_names_primary,
+    protein_description = protein_names)
+```
 
-```{r summary_stats}
-# Generate summary statistics
-summary_stats <- all_results %>%
-  dplyr::mutate(
-    normalization = case_when(
-      dataset == "non_protnorm" ~ "Non Protein-Normalized",
-      dataset == "protnorm_with_lost" ~ "Protein-Normalized",
-      TRUE ~ "Unknown"
-    )
-  ) %>%
-  group_by(contrast, normalization, specificity, processing_type) %>%
+# Basic Identification Statistics
+
+```{r}
+# calculate number of identifications per sample
+tabular_nr_of_ids_per_sample <- exploratory_results$annotated_df_quant %>%
+  dplyr::select(all_of(exploratory_results$experimental_design$sample)) %>%
+  # pivot_longer to get the data in a long format
+  tidyr::pivot_longer(cols = all_of(exploratory_results$experimental_design$sample),
+                      names_to = "sample",
+                      values_to = "value") %>%
+  group_by(sample) %>%
   summarise(
-    total_features = n(),
-    upregulated = sum(adj.P.Val < pval_threshold & logFC > log2(fc_threshold)),
-    downregulated = sum(adj.P.Val < pval_threshold & logFC < -log2(fc_threshold)),
-    not_significant = sum(adj.P.Val >= pval_threshold | abs(logFC) <= log2(fc_threshold)),
+    n_ids_per_sample = sum(!is.na(value))
+  ) 
+
+
+# calculate number of identifications per sample and modification
+tabular_nr_of_ids_per_sample_modif <- exploratory_results$annotated_df_quant %>%
+  dplyr::select(nterm_modif, all_of(exploratory_results$experimental_design$sample)) %>%
+  # pivot_longer to get the data in a long format
+  tidyr::pivot_longer(cols = all_of(exploratory_results$experimental_design$sample),
+                      names_to = "sample",
+                      values_to = "value") %>%
+  group_by(nterm_modif, sample) %>%
+  summarise(
+    n_ids_per_sample_n_modif = sum(!is.na(value))
+  )
+
+tabular_nr_of_ids_per_aa_before <- exploratory_results$annotated_df_quant %>%
+  dplyr::select(
+    nterm_modif_peptide, nterm_modif, p1_residue, 
+    all_of(exploratory_results$experimental_design$sample)) %>%
+  # pivot_longer to get the data in a long format
+  tidyr::pivot_longer(cols = all_of(exploratory_results$experimental_design$sample),
+                      names_to = "sample",
+                      values_to = "value") %>%
+  group_by(nterm_modif, p1_residue, sample) %>%
+  summarise(
+    n_identifications = sum(!is.na(value))
+  ) %>%
+  ungroup() %>%
+  left_join(., tabular_nr_of_ids_per_sample) %>%
+  left_join(., tabular_nr_of_ids_per_sample_modif) %>%
+  mutate(
+    percentage_of_ids_per_sample = n_identifications / n_ids_per_sample * 100,
+    percentage_of_ids_per_sample_n_modif = n_identifications / n_ids_per_sample_n_modif * 100
+  ) 
+```
+
+## Total Number of Identifications per Sample
+
+```{r total_ids_plot}
+#| fig-width: 8
+#| fig-height: 20
+
+# Plot total identifications per sample
+tabular_nr_of_ids_per_sample %>%
+  left_join(exploratory_results$experimental_design, by = "sample") %>%
+  ggplot(aes(x = reorder(sample, n_ids_per_sample), 
+             y = n_ids_per_sample,
+             fill = condition)) +
+  geom_col() +
+  labs(
+    title = "Total Number of Identifications per Sample",
+    x = "Sample",
+    y = "Number of identifications\n(N-term modif + peptide)",
+    fill = "Condition"
+  ) +
+  coord_flip() +
+  theme_minimal() + 
+  theme(
+    axis.text.y = element_blank(),
+    legend.position = "bottom"
+  )
+```
+
+## Identifications by N-terminal Modification and Preceding Amino Acid
+
+```{r ids_by_modification_detailed}
+#| fig-width: 8
+#| fig-height: 20
+
+# Plot identifications by modification type
+tabular_nr_of_ids_per_aa_before %>% 
+  left_join(exploratory_results$experimental_design, by = "sample") %>%
+  ggplot(aes(x = reorder(sample, n_identifications),
+             y = n_identifications,
+             fill = p1_residue)) +
+  facet_wrap(.~ nterm_modif, ncol = 2) +
+  geom_col() +
+  coord_flip() +
+  labs(
+    title = "Number of IDs per N-terminal Modification and Preceding Amino Acid",
+    x = "Sample",
+    y = "Number of identifications\n(N-term modif + peptide)",
+    fill = "Preceding residue"
+  ) +
+  theme_minimal() + 
+  theme(
+    axis.text.y = element_blank(),
+    legend.position = "bottom"
+  )
+```
+
+## Identifications by N-terminal Modification (Excluding R and K)
+
+```{r ids_by_modification_no_rk}
+#| fig-width: 14
+#| fig-height: 20
+
+# Plot identifications excluding R and K residues
+tabular_nr_of_ids_per_aa_before %>%
+  filter(p1_residue != "R", p1_residue != "K") %>%
+  left_join(exploratory_results$experimental_design, by = "sample") %>%
+  ggplot(aes(x = reorder(sample, n_identifications),
+             y = n_identifications,
+             fill = p1_residue)) +
+  facet_wrap(.~ nterm_modif, ncol = 2) +
+  geom_col() +
+  coord_flip() +
+  labs(
+    title = "Number of IDs per N-terminal Modification and Preceding Amino Acid",
+    subtitle = "Excluding R and K residues",
+    x = "Sample",
+    y = "Number of identifications\n(N-term modif + peptide)",
+    fill = "Preceding residue"
+  ) +
+  theme_minimal() + 
+  theme(
+    axis.text.y = element_blank(),
+    legend.position = "bottom"
+  )
+```
+
+## Proportion of Identifications by Preceding Amino Acid
+
+```{r ids_proportion_aa}
+#| fig-width: 15
+#| fig-height: 20
+
+# Plot proportions with R residue percentages
+tabular_nr_of_ids_per_aa_before %>% 
+  left_join(exploratory_results$experimental_design, by = "sample") %>%
+  ggplot(aes(x = reorder(sample, percentage_of_ids_per_sample_n_modif),
+             y = percentage_of_ids_per_sample_n_modif,
+             fill = p1_residue)) +
+  facet_wrap(.~ nterm_modif, ncol = 2) +
+  geom_col() +
+  coord_flip() +
+  labs(
+    title = "Proportion of IDs per N-terminal Modification and Preceding Amino Acid",
+    caption = "Numbers on the plot represent % of R residues at preceding amino acid in the sample",
+    x = "Sample",
+    y = "% of total identifications per sample\n(N-term modif + peptide)",
+    fill = "Preceding residue"
+  ) +
+  # add a text label on top only of the R residues
+  theme_minimal() + 
+  theme(
+    axis.text.y = element_blank(),
+    legend.position = "bottom"
+  )
+```
+
+## Median Identifications by Processing Type
+
+```{r}
+# Calculate identifications by specificity and refined processing type (excluding specific peptides)
+
+ids_by_specificity_refined <- exploratory_results$annotated_df_quant %>%
+  filter(specificity %in% c("semi_Cterm", "semi_Nterm")) %>%
+  dplyr::select(specificity, processing_type, nterm_modif, all_of(exploratory_results$experimental_design$sample)) %>%
+  pivot_longer(cols = all_of(exploratory_results$experimental_design$sample),
+               names_to = "sample",
+               values_to = "value") %>%
+  group_by(specificity, nterm_modif, processing_type, sample) %>%
+  summarise(n_identifications = sum(!is.na(value)), .groups = 'drop') %>%
+  left_join(
+    exploratory_results$experimental_design, 
+    by = "sample")
+
+# Calculate median identifications by refined processing type
+median_ids_refined_processing <- ids_by_specificity_refined %>%
+  group_by(specificity, nterm_modif, processing_type, condition) %>%
+  summarise(
+    median_ids = median(n_identifications),
+    mean_ids = mean(n_identifications),
+    sd_ids = sd(n_identifications),
+    n_samples = n(),
     .groups = 'drop'
   )
 
-knitr::kable(summary_stats, caption = "Summary of Differential Analysis Results")
+```
+
+```{r median_ids_processing}
+#| fig-width: 14
+#| fig-height: 10
+
+# Plot median identifications with facet_grid (horizontal bars)
+plot_median_refined <- median_ids_refined_processing %>%
+  ggplot(aes(x = median_ids, 
+             y = condition,
+             fill = condition)) +
+  geom_col() +
+  geom_errorbar(aes(xmin = median_ids - sd_ids, 
+                    xmax = median_ids + sd_ids),
+                width = 0.3, alpha = 0.7) +
+  geom_text(aes(label = round(median_ids, 0)), 
+            hjust = -0.1, vjust = -1, size = 3) +
+  facet_grid(processing_type ~ nterm_modif + specificity, scales = "free_x") +
+  scale_x_continuous(expand = expansion(mult = c(0, 0.05))) +
+  labs(
+    title = "Median Number of Identifications by Processing Type",
+    subtitle = "Semi-specific peptides only, grouped by specificity and processing type",
+    x = "Median number of identifications",
+    y = "Condition",
+    fill = "Condition"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.y = element_text(angle = 0, hjust = 1),
+    legend.position = "bottom",
+    strip.text = element_text(size = 9)
+  )
+
+print(plot_median_refined)
+
+# Display summary table
+knitr::kable(median_ids_refined_processing, 
+             caption = "Summary Statistics: Identifications by Refined Processing Type and Condition",
+             digits = 1)
 ```
 
 # Proportional Abundances Analysis
 
-```{r proportional_abundances}
+```{r}
+# extract peptide level data from summarized experiment object
+
+mat_df_rawpur_nona <- as.data.frame(assay(exploratory_results$se_pept_imp_raw))
+
+col_dat_df_rawpur_nona <- data.frame(colData(exploratory_results$se_pept_imp_raw))
+
+row_dat_df_rawpur_nona <- data.frame(rowData(exploratory_results$se_pept_imp_raw))
+
+# transform into long format
+mat_df_rawpur_nona_long <- mat_df_rawpur_nona %>%
+  tibble::rownames_to_column("nterm_modif_peptide") %>%
+  tidyr::pivot_longer(cols = where(is.numeric), 
+                      names_to = "sample", 
+                      values_to  = "Intensity") %>%
+  dplyr::left_join(., col_dat_df_rawpur_nona, 
+                   by = "sample") %>%
+  dplyr::left_join(., row_dat_df_rawpur_nona,
+                   by = "nterm_modif_peptide") 
+```
+
+```{r}
+# filter long data to keep only interesting products
+mat_df_rawpur_nona_long_proteolytic <- mat_df_rawpur_nona_long %>%
+  dplyr::filter(
+    specificity %in% params$interesting_specificity, # exclude peptides with a preceding R or K
+    nterm_modif %in% params$interesting_nterm_modif) %>% # keep only acetyl or unmodified peptides
+  dplyr::mutate(
+    condition = factor(condition, 
+                         levels = condition_levels)
+  )
+
+pept_summ_rawpur_semi_1 <- mat_df_rawpur_nona_long_proteolytic %>% 
+  group_by(sample, condition) %>%
+  summarise(`Summed Abundances Semis` = sum(Intensity, na.rm = TRUE)) 
+
+# get the summ of all peptides per sample/condition 
+pept_summ_rawpur_all <- mat_df_rawpur_nona_long %>% 
+  group_by(sample, condition) %>%
+  summarise(`Summer Abundances Total` = sum(Intensity, na.rm = TRUE)) 
+
+# merge the two data frames to get the normalized abundances of proteolytic products
+pept_summ_rawpur_semi_3 <- pept_summ_rawpur_semi_1 %>%
+  dplyr::left_join(., pept_summ_rawpur_all, 
+                   by = c("sample", "condition")) %>%
+  mutate(`% of Semi/Total Abundances` = `Summed Abundances Semis`/`Summer Abundances Total` * 100 ) %>%
+  mutate(
+    condition = factor(condition, 
+                       levels = condition_levels)
+    ) %>%
+  left_join(., 
+            experimental_design %>% 
+              dplyr::select(sample, bio_replicate), 
+            by = "sample")
+```
+
+```{r proportion_plots}
 #| fig-width: 12
 #| fig-height: 5
 
-get_linear_assay <- function(se) {
-  mat <- SummarizedExperiment::assay(se)
-  # Heuristic: if values look like log2 scale, back-transform
-  mx <- suppressWarnings(max(mat, na.rm = TRUE))
-  if (is.finite(mx) && mx < 50) 2^mat else mat
-}
+# First plot: points and lines
+plot_lines <- ggplot(pept_summ_rawpur_semi_3, 
+  aes(x = condition, 
+      y = `% of Semi/Total Abundances`,
+      color = condition)) +
+  geom_point(aes(group = bio_replicate), 
+             alpha = 0.7, 
+             size = 2) +
+  geom_line(aes(group = bio_replicate), 
+            alpha = 0.5, 
+            color = "gray50") +
+  labs(x = "Condition",
+       y = "% Abundance of Proteolytic products",
+       title = "Proportional abundances of proteolytic products - Connected by replicate") +
+  theme_minimal() +
+  theme(legend.position = "bottom")
 
-if (!is.null(se_with_lost)) {
+# Second plot: boxplot with jittered points
+plot_boxplot <- ggplot(pept_summ_rawpur_semi_3, 
+  aes(x = condition, 
+      y = `% of Semi/Total Abundances`,
+      fill = condition)) +
+  geom_boxplot() +
+  geom_jitter(alpha = 0.5, 
+              size = 1,
+              width = 0.2) +
+  labs(x = "Condition",
+       y = "% Abundance of Proteolytic products",
+       title = "Proportional abundances of proteolytic products - Distribution") +
+  theme_minimal() +
+  theme(legend.position = "bottom")
 
-  mat_lin <- get_linear_assay(se_with_lost)
+print(plot_lines)
+print(plot_boxplot)
+```
 
-  rd <- as.data.frame(rowData(se_with_lost))
+# Differential Abundance Analysis Results
 
-  semi_idx <- stringr::str_detect(dplyr::coalesce(rd$specificity, ""), "^semi")
+## Prepare volcano plot data
 
-  semi_sum <- colSums(mat_lin[semi_idx, , drop = FALSE], na.rm = TRUE)
-
-  total_sum <- colSums(mat_lin, na.rm = TRUE)
-
-  prop_df <- tibble(
-    sample = colnames(mat_lin),
-    `percent_semi_over_total` = 100 * semi_sum / pmax(total_sum, .Machine$double.eps)
-  ) %>%
-    left_join(experimental_design, by = "sample") 
-
-  # Boxplot with jitter (line plot removed by request)
-  plot_box <- ggplot(
-    prop_df,
-    aes(
-      x = condition,
-      y = `percent_semi_over_total`,
-      fill = condition
+```{r prepare_volcano_data}
+# Function to prepare volcano data
+prepare_volcano_data <- function(data, fc_thresh = fc_threshold, p_thresh = pval_threshold, contrast_levels = contrast_levels) {
+  df <- data %>%
+    mutate(
+      `-log10_adj.P.Val` = -log10(adj.P.Val),
+      regulation = case_when(
+        logFC > fc_thresh & adj.P.Val < p_thresh ~ "upregulated",
+        logFC < -fc_thresh & adj.P.Val < p_thresh ~ "downregulated",
+        TRUE ~ "non-changing"
+      ),
+      contrast = factor(
+        contrast,
+        levels = contrast_levels
+      )
     )
-  ) +
-    geom_boxplot(outlier.alpha = 0.3) +
-    geom_jitter(alpha = 0.5, width = 0.2, size = 1) +
-    labs(
-      x = "Condition",
-      y = "% Abundance of proteolytic products",
-      title = "Proportional abundances of proteolytic products - Distribution"
-    ) +
-    theme_minimal() +
-    theme(legend.position = "bottom")
 
-  print(plot_box)
+    # evaluate proper definition of contrast levels
+    if (any(is.na(df$contrast))) {
 
-} else {
-
-  message("se_with_lost not available; skipping proportional abundance plots.")
-
+      stop("At least some contrast levels in the data are not properly defined in contrast_levels parameter. Please check.")
+    
+    }
+  
+  return(df)
 }
+
+# Prepare data for all analyses
+volcano_data_before <- prepare_volcano_data(
+  limma_results$by_dataset$non_protnorm$results, 
+  contrast_levels = contrast_levels)
+
+volcano_data_after <- prepare_volcano_data(
+  limma_results$by_dataset$protnorm_with_lost$results, 
+  contrast_levels = contrast_levels)
+
+volcano_data_protein <- prepare_volcano_data(
+  limma_results$by_dataset$protein_abund_norm$results, 
+  contrast_levels = contrast_levels)
+```
+
+## Volcano Plots
+
+```{r volcano_plots}
+#| fig-width: 15
+#| fig-height: 5
+
+# Function to create volcano plot
+create_volcano_plot <- function(data, title_text, subtitle_text) {
+  # Count significant features
+  counts <- data %>%
+    dplyr::filter(regulation != "non-changing") %>%
+    group_by(contrast) %>%
+    summarise(count = n(), .groups = 'drop')
+  
+  ggplot(data, aes(x = logFC, y = `-log10_adj.P.Val`, color = regulation)) +
+    geom_point(alpha = 0.7) +
+    geom_hline(yintercept = -log10(pval_threshold), 
+               linetype = "dashed", color = "red") +
+    scale_color_manual(values = c("upregulated" = "red", 
+                                  "downregulated" = "blue", 
+                                  "non-changing" = "grey")) +
+    facet_wrap(~ contrast, ncol = 3) +
+    theme_minimal() +
+    labs(title = title_text,
+         subtitle = subtitle_text,
+         x = "Log Fold Change", 
+         y = "-log10(adjusted P-value)", 
+         color = "Regulation") +
+    theme(strip.text.x = element_text(size = 10),
+          axis.text = element_text(size = 8),
+          axis.title = element_text(size = 10),
+          legend.position = "bottom") +
+    geom_text(data = counts, aes(x = Inf, y = Inf, label = count),
+              hjust = 1.1, vjust = 1.5, size = 4, color = "black", inherit.aes = FALSE)
+}
+
+# Create volcano plots
+volcano_before <- create_volcano_plot(
+  volcano_data_before,
+  "Differential Abundance: Before Protein Normalization",
+  "Neo-termini analysis"
+)
+
+volcano_after <- create_volcano_plot(
+  volcano_data_after,
+  "Differential Abundance: After Protein Normalization", 
+  "Neo-termini analysis"
+)
+
+volcano_protein <- create_volcano_plot(
+  volcano_data_protein,
+  "Differential Abundance: Protein Level",
+  "Based on fully specific peptides"
+)
+
+print(volcano_before)
+print(volcano_after)
+print(volcano_protein)
+```
+
+## Summary Statistics
+
+```{r summary_stats}
+# Create summary of differential features
+create_summary <- function(data, analysis_name) {
+  data %>%
+    filter(regulation != "non-changing") %>%
+    group_by(contrast, regulation) %>%
+    summarise(count = n(), .groups = 'drop') %>%
+    mutate(analysis = analysis_name)
+}
+
+summary_stats <- bind_rows(
+  create_summary(volcano_data_before, "Before Protein Norm"),
+  create_summary(volcano_data_after, "After Protein Norm"),
+  create_summary(volcano_data_protein, "Protein Level")
+)
+
+# Plot summary
+ggplot(summary_stats, aes(x = contrast, y = count, fill = regulation)) +
+  geom_col(position = position_dodge(width = 0.8)) +
+  geom_text(aes(label = count),
+            position = position_dodge(width = 0.8),
+            vjust = -0.5, size = 3) +
+  facet_wrap(~ analysis, scales = "free_y") +
+  scale_fill_manual(values = c("upregulated" = "red", "downregulated" = "blue")) +
+  labs(title = "Summary of Differentially Abundant Features",
+       x = "Contrast", y = "Number of Features", fill = "Regulation") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = "bottom")
 ```
 
 # Principal Component Analysis
 
 ```{r pca_analysis}
 #| fig-width: 14
-#| fig-height: 7
+#| fig-height: 14
 
-perform_pca_plot_from_se <- function(se, title_text) {
-
-  if (is.null(se)) return(invisible(NULL))
-
-  mat <- SummarizedExperiment::assay(se)
-
-  # remove features with zero variance
-  keep <- apply(mat, 1, function(x) sd(x, na.rm = TRUE) > 0)
-
-  mat <- mat[keep, , drop = FALSE]
-
-  if (ncol(mat) < 2 || nrow(mat) < 2) return(invisible(NULL))
-
-  X <- t(mat)
-
-  pca_res <- mixOmics::pca(X, ncomp = 2, scale = TRUE)
-
-  scores <- as.data.frame(pca_res$x[, 1:2])
-
-  colnames(scores) <- c("PC1", "PC2")
-
-  scores$sample <- rownames(pca_res$x)
-
-  pca_df <- scores %>% dplyr::left_join(experimental_design, by = "sample")
-
-  var1 <- round(pca_res$prop_expl_var$X[1] * 100, 1)
-  var2 <- round(pca_res$prop_expl_var$X[2] * 100, 1)
-
+# Function to perform PCA and create plot
+perform_pca_plot <- function(abundance_matrix, title_text, sample_data = sample_annotation) {
+  # Transpose matrix for PCA
+  t_matrix <- t(abundance_matrix)
+  
+  # Perform PCA
+  pca_res <- pca(t_matrix, ncomp = 2)
+  
+  # Prepare data for plotting
+  pca_df <- pca_res$x[, 1:2] %>%
+    as.data.frame() %>%
+    rownames_to_column(var = "sample") %>%
+    left_join(sample_data, by = "sample")
+  
+  # Get variance explained
+  var_exp_pc1 <- pca_res$prop_expl_var$X[1]
+  var_exp_pc2 <- pca_res$prop_expl_var$X[2]
+  
+  # Create plot
   ggplot(pca_df, aes(x = PC1, y = PC2, color = condition)) +
-    geom_point(size = 3, alpha = 0.9) +
+    geom_point(size = 3.5) +
+    stat_ellipse(level = 0.50) +
     labs(title = title_text,
-         subtitle = paste0("PC1: ", var1, "%, PC2: ", var2, "%")) +
+         x = paste("PC1 - Variance explained:", round(var_exp_pc1, 3) * 100, "%"),
+         y = paste("PC2 - Variance explained:", round(var_exp_pc2, 3) * 100, "%"),
+         color = "Condition") +
     theme_minimal() +
     theme(legend.position = "bottom")
 }
 
-pca_non_prot <- perform_pca_plot_from_se(
-  se_non_protnorm, 
-  "PCA: Non protein-normalized peptides")
+# Create PCA plots
+pca_before <- perform_pca_plot(
+  assay(exploratory_results$se_pept_non_protnorm),
+  "PCA: Neo-termini Before Protein Normalization",
+  sample_data = experimental_design
+)
 
-pca_prot_with_lost <- perform_pca_plot_from_se(
-  se_with_lost, 
-  "PCA: Protein-normalized")
+pca_after <- perform_pca_plot(
+  assay(exploratory_results$se_pept_protnorm_with_lost),
+  "PCA: Neo-termini After Protein Normalization",
+  sample_data = experimental_design
+)
 
-ggarrange(pca_non_prot, pca_prot_with_lost, ncol = 2, common.legend = TRUE, legend = "bottom")
+pca_protein <- perform_pca_plot(
+  assay(exploratory_results$se_prot_norm),
+  "PCA: Protein Abundance Data",
+  sample_data = experimental_design
+)
+
+# Arrange plots
+ggarrange(
+  pca_before, 
+  pca_after, 
+  pca_protein, 
+  ncol = 2, 
+  nrow = 2, 
+  common.legend = TRUE, 
+  legend = "bottom")
 ```
 
-# PCA by specificity (semi_Cterm vs semi_Nterm)
+# Principal Component Analysis - Comprehensive Analysis
 
-```{r pca_by_specificity}
-#| fig-width: 14
-#| fig-height: 14
+```{r pca_comprehensive}
+#| fig-width: 16
+#| fig-height: 22
 
-filter_se_by_specificity <- function(se, pattern) {
-  if (is.null(se)) return(se)
-  rd <- as.data.frame(rowData(se))
-  idx <- stringr::str_detect(dplyr::coalesce(rd$specificity, ""), pattern)
-  se[idx, , drop = FALSE]
-}
-
-p1 <- perform_pca_plot_from_se(
-  filter_se_by_specificity(
-    se_with_lost,
-    "^semi_Cterm$"
-  ),
-  "PCA: protnorm semi_Cterm"
+# Create all PCA plots
+pca_neo_before <- perform_pca_plot(
+  exploratory_results$se_pept_non_protnorm[
+  # filter row data to only neo-termini
+  rowData(exploratory_results$se_pept_non_protnorm)$nterm_modif %in% exploratory_results$parameters$interesting_nterm_modif & 
+  rowData(exploratory_results$se_pept_non_protnorm)$specificity %in% exploratory_results$parameters$interesting_specificity
+    ] %>%
+    assay(),
+  "All Neo-termini (Before Protein Norm)",
+  sample_data = experimental_design
 )
 
-p2 <- perform_pca_plot_from_se(
-  filter_se_by_specificity(
-    se_with_lost,
-    "^semi_Nterm$"
-  ),
-  "PCA: protnorm semi_Nterm"
+pca_neo_after <- perform_pca_plot(
+  exploratory_results$se_pept_protnorm_with_lost[
+  # filter row data to only neo-termini
+  rowData(exploratory_results$se_pept_protnorm_with_lost)$nterm_modif %in% exploratory_results$parameters$interesting_nterm_modif & 
+  rowData(exploratory_results$se_pept_protnorm_with_lost)$specificity %in% exploratory_results$parameters$interesting_specificity
+    ] %>%
+    assay(),
+  "All Neo-termini (After Protein Norm)",
+  sample_data = experimental_design
 )
 
-p3 <- perform_pca_plot_from_se(
-  filter_se_by_specificity(
-    se_non_protnorm,
-    "^semi_Cterm$"
-  ),
-  "PCA: non-protnorm semi_Cterm"
+pca_semi_c_before <- perform_pca_plot(
+  exploratory_results$se_pept_non_protnorm[
+    # filter row data to only neo-termini
+    rowData(exploratory_results$se_pept_non_protnorm)$nterm_modif %in% exploratory_results$parameters$interesting_nterm_modif & 
+    rowData(exploratory_results$se_pept_non_protnorm)$specificity %in% "semi_Cterm"
+    ] %>%
+    assay(),
+  "Semi C-terminal (Before Protein Norm)",
+  sample_data = experimental_design
 )
 
-p4 <- perform_pca_plot_from_se(
-  filter_se_by_specificity(
-    se_non_protnorm,
-    "^semi_Nterm$"
-  ),
-  "PCA: non-protnorm semi_Nterm"
+pca_semi_c_after <- perform_pca_plot(
+  exploratory_results$se_pept_protnorm_with_lost[
+    # filter row data to only neo-termini
+    rowData(exploratory_results$se_pept_protnorm_with_lost)$nterm_modif %in% exploratory_results$parameters$interesting_nterm_modif & 
+    rowData(exploratory_results$se_pept_protnorm_with_lost)$specificity %in% "semi_Cterm"
+    ] %>%
+    assay(),
+  "Semi C-terminal (After Protein Norm)",
+  sample_data = experimental_design
 )
 
-ggarrange(p1, p2, p3, p4, ncol = 2, nrow = 2, common.legend = TRUE, legend = "bottom")
+pca_semi_n_before <- perform_pca_plot(
+  exploratory_results$se_pept_non_protnorm[
+    # filter row data to only neo-termini
+    rowData(exploratory_results$se_pept_non_protnorm)$nterm_modif %in% exploratory_results$parameters$interesting_nterm_modif & 
+    rowData(exploratory_results$se_pept_non_protnorm)$specificity %in% "semi_Nterm"
+    ] %>%
+    assay(),
+  "Semi N-terminal (Before Protein Norm)",
+  sample_data = experimental_design
+)
+
+pca_semi_n_after <- perform_pca_plot(
+  exploratory_results$se_pept_protnorm_with_lost[
+    # filter row data to only neo-termini
+    rowData(exploratory_results$se_pept_protnorm_with_lost)$nterm_modif %in% exploratory_results$parameters$interesting_nterm_modif & 
+    rowData(exploratory_results$se_pept_protnorm_with_lost)$specificity %in% "semi_Nterm"
+    ] %>%
+    assay(),
+  "Semi N-terminal (After Protein Norm)",
+  sample_data = experimental_design
+)
+
+pca_protein <- perform_pca_plot(
+  exploratory_results$se_prot_norm %>%
+    assay(),
+  "Protein Abundance Data",
+  sample_data = experimental_design
+)
+
+# Arrange all plots
+ggarrange(
+  pca_neo_before, pca_neo_after,
+  pca_semi_c_before, pca_semi_c_after,
+  pca_semi_n_before, pca_semi_n_after,
+  pca_protein, NULL,
+  ncol = 2, nrow = 4, 
+  common.legend = TRUE, legend = "bottom"
+)
 ```
 
 # Intersection Analysis: Before vs After Protein Normalization
@@ -367,9 +790,11 @@ ggarrange(p1, p2, p3, p4, ncol = 2, nrow = 2, common.legend = TRUE, legend = "bo
 #| fig-height: 4
 
 if (!is.null(all_results) && all(c("dataset", "contrast", "nterm_modif_peptide", "logFC", "adj.P.Val") %in% names(all_results))) {
+
   contrasts <- unique(all_results$contrast)
 
   make_sets <- function(contrast_name, direction = c("up", "down")) {
+
     direction <- match.arg(direction)
     df <- all_results %>% dplyr::filter(contrast == contrast_name)
 
@@ -435,112 +860,134 @@ if (!is.null(all_results) && all(c("dataset", "contrast", "nterm_modif_peptide",
 }
 ```
 
-# Cleavage Pattern Analysis
+# Cleavage Pattern Analysis (requires user input, project-specific)
+
+## Prepare gene-ontology annotation (for determining intra- vs extracellular)
+
+```{r}
+# prepare gene-ontology grouping 
+
+go_annotation_df <- as.data.frame(go_groups_df$protnorm_with_lost@result) %>%
+  dplyr::rename(
+    go_id = ID,
+    go_description = Description,
+    gene = geneID
+  ) %>%
+  dplyr::select(
+    go_id,
+    go_description,
+    gene
+  ) %>%
+  distinct() %>%
+  separate_rows(gene, sep = "/") %>%
+  dplyr::filter(
+    !is.na(gene),
+    gene != ""
+  )
+
+# merge GO annotation with volcano data
+
+volcano_data_after_w_go <- volcano_data_after %>%
+  left_join(
+    protein_annotation %>%
+      dplyr::select(protein, gene),
+    by = c("protein" = "protein")
+  ) %>%
+  left_join(
+    go_annotation_df,
+    by = c("gene" = "gene")
+  ) %>% 
+  # collapse the go_id and go_description columns to have all terms per protein in one row
+  group_by(
+    across(-c(go_id, go_description))) %>%
+  summarise(
+    go_id = paste(unique(go_id), collapse = "; "),
+    go_description = paste(unique(go_description), collapse = "; "),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    extracellular_or_cytoplasm = case_when(
+      str_detect(go_description, "extracellular") ~ "extracellular",
+      str_detect(go_description, "cytoplasm|intracellular") ~ "intracellular|cytoplasm",
+      TRUE ~ "other"
+    )
+  )
+```
 
 ## Prepare Data for Cleavage Analysis
 
 ```{r cleavage_data_prep}
-required_cols <- c(
-  "processing_type", "specificity", "x_res_before", "x_res_after",
-  "dataset", "contrast", "adj.P.Val", "logFC"
-)
+# Function to extract cleavage sequences for each contrast
+get_upreg_cleavage_sequences <- function(
+  contrast_name,
+  regulation_type = "upregulated",
+  nterm_modif = "all",
+  processing_type = "not_canonical"
+  ) {
 
-cleavage_available <- all(required_cols %in% names(all_results))
+  build_sets_for_modif <- function(modif_value) {
 
-if (cleavage_available) {
-  # Significant, non-canonical, protein-normalized, semi-specific features across all contrasts
-  fc_thr <- log2(fc_threshold)
+    base_df <- volcano_data_after_w_go %>%
+      filter(
+        contrast == contrast_name,
+        regulation == regulation_type,
+        processing_type == processing_type,
+        nterm_modif == modif_value,
+        p1_position > 2 # avoid N-terminal residues
+      ) %>%
+      mutate(cleavage_sequence_x = paste0(x_res_before, x_res_after))
 
-  diffabund_features <- all_results %>%
-    dplyr::filter(
-      dataset == "protnorm_with_lost",
-      processing_type == "not_canonical",
-      adj.P.Val < pval_threshold
-    ) %>%
-    dplyr::mutate(
-      is_semi = stringr::str_detect(dplyr::coalesce(specificity, ""), "^semi"),
-      cleavage_sequence_x = paste0(x_res_before, x_res_after)
-    ) %>%
-    dplyr::filter(is_semi)
+    extracellular <- base_df %>%
+      filter(str_detect(extracellular_or_cytoplasm, "extracellular"))
+    intracellular <- base_df %>%
+      filter(str_detect(extracellular_or_cytoplasm, "intracellular|cytoplasm"))
 
-  # Split by contrast and, for each contrast, return a list with two character vectors:
-  #   - upregulated: cleavage P1-P1' sequences with logFC > fc_thr
-  #   - downregulated: cleavage P1-P1' sequences with logFC < -fc_thr
-  cleavage_sets_by_contrast <- diffabund_features %>%
-    split(.$contrast) %>%
-    purrr::imap(function(df, cn) {
-      up_vec <- df %>%
-        dplyr::filter(logFC > fc_thr) %>%
-        dplyr::pull(cleavage_sequence_x) %>%
-        stats::na.omit() %>%
-        unique() %>%
-        as.character()
+    list(
+      contrast = contrast_name,
+      nterm_modif = modif_value,
+      c_term_int = intracellular %>%
+        filter(specificity == "semi_Cterm") %>%
+        pull(cleavage_sequence_x),
+      c_term_ext = extracellular %>%
+        filter(specificity == "semi_Cterm") %>%
+        pull(cleavage_sequence_x),
+      n_term_int = intracellular %>%
+        filter(specificity == "semi_Nterm") %>%
+        pull(cleavage_sequence_x),
+      n_term_ext = extracellular %>%
+        filter(specificity == "semi_Nterm") %>%
+        pull(cleavage_sequence_x)
+    )
+  }
 
-      down_vec <- df %>%
-        dplyr::filter(logFC < -fc_thr) %>%
-        dplyr::pull(cleavage_sequence_x) %>%
-        stats::na.omit() %>%
-        unique() %>%
-        as.character()
+  if (nterm_modif == "all") {
 
-      list(
-        upregulated = up_vec,
-        downregulated = down_vec
-      )
-    })
+    modifs <- volcano_data_after_w_go %>%
+      dplyr::pull(nterm_modif) %>%
+      unique() %>%
+      stats::na.omit() %>%
+      as.character()
 
-} else {
+    modifs <- sort(modifs)
 
-  message("Cleavage annotations not found in results; skipping cleavage analyses.")
+    return(
+      purrr::map(modifs, build_sets_for_modif) %>%
+        purrr::set_names(modifs)
+    )
+  }
 
+  build_sets_for_modif(nterm_modif)
 }
-```
 
-## Diagnostics: cleavage heatmap input vs DA counts
-
-```{r cleavage_diagnostics}
-# Provide a per-contrast diagnostic to explain differences between DA counts and heatmap inputs
-if (all(c("dataset", "contrast", "adj.P.Val", "logFC", "processing_type", "specificity", "x_res_before", "x_res_after") %in% names(all_results))) {
-
-  fc_thr <- log2(fc_threshold)
-
-  protnorm_sig <- all_results %>%
-    dplyr::filter(
-      dataset == "protnorm_with_lost",
-      adj.P.Val < pval_threshold
-    ) %>%
-    dplyr::mutate(
-      has_cleavage_pos = !is.na(x_res_before) & !is.na(x_res_after),
-      is_non_canonical = processing_type == "not_canonical",
-      is_semi = stringr::str_detect(dplyr::coalesce(specificity, ""), "^semi"),
-      cleavage_sequence_x = paste0(x_res_before, x_res_after),
-      direction = dplyr::case_when(
-        logFC > fc_thr ~ "upregulated",
-        logFC < -fc_thr ~ "downregulated",
-        TRUE ~ "not_counted"
-      )
-    ) %>%
-    dplyr::filter(direction != "not_counted")
-
-  diag_tbl <- protnorm_sig %>%
-    dplyr::group_by(contrast, direction) %>%
-    dplyr::summarise(
-      da_total = dplyr::n(),
-      with_cleavage_positions = sum(has_cleavage_pos, na.rm = TRUE),
-      after_non_canonical = sum(has_cleavage_pos & is_non_canonical, na.rm = TRUE),
-      semi_specific = sum(has_cleavage_pos & is_non_canonical & is_semi, na.rm = TRUE),
-      unique_sequences = dplyr::n_distinct(cleavage_sequence_x[has_cleavage_pos & is_non_canonical & is_semi]),
-      .groups = "drop"
-    ) %>%
-    dplyr::arrange(contrast, direction)
-
-  knitr::kable(diag_tbl, caption = "Diagnostics: DA vs cleavage heatmap inputs (protein-normalized)")
-
-} else {
-
-  message("Required columns for cleavage diagnostics not found; skipping.")
-
-}
+# Loop over contrasts defined in the first chunk
+cleavage_sequences_by_contrast <- purrr::map(
+  contrast_levels,
+  get_upreg_cleavage_sequences,
+  regulation_type = "upregulated",
+  nterm_modif = "all",
+  processing_type = "not_canonical"
+) %>%
+  purrr::set_names(contrast_levels)
 ```
 
 ## Cleavage Pattern Heatmaps
@@ -549,220 +996,180 @@ if (all(c("dataset", "contrast", "adj.P.Val", "logFC", "processing_type", "speci
 #| fig-width: 6
 #| fig-height: 4
 
-if (isTRUE(cleavage_available) && requireNamespace("TermineR", quietly = TRUE)) {
+# Helper to plot heatmaps for a given sequence list
+plot_cleavage_heatmaps <- function(seq_list, contrast_name, modif_name, p_number = 10) {
 
-  # Plot a cleavage heatmap for a vector of cleavage-area sequences
-  plot_cleavage_heatmap <- function(seqs, title_text, p_num = 10, min_n = 1) {
+  # Build count matrices safely (empty vectors return NULL)
+  mk_counts <- function(x) {
+    if (length(x) == 0) return(NULL)
+    cleavage_area_matrix(x, p_number = p_number)$amino_acid_count
+  }
 
-    seqs <- seqs[!is.na(seqs)]
-    if (!length(seqs) || length(seqs) < min_n) return(invisible(NULL))
+  counts <- list(
+    c_int = mk_counts(seq_list$c_term_int),
+    c_ext = mk_counts(seq_list$c_term_ext),
+    n_int = mk_counts(seq_list$n_term_int),
+    n_ext = mk_counts(seq_list$n_term_ext)
+  )
 
-    # Adjust p_number to sequence lengths (supports simple P1-P1' pairs too)
-    max_len <- suppressWarnings(max(nchar(seqs), na.rm = TRUE))
-    p_use <- max(1L, min(p_num, floor(max_len / 2)))
+  op <- par(mfrow = c(2, 2))
+  on.exit(par(op), add = TRUE)
 
-    cam <- tryCatch(
-      TermineR::cleavage_area_matrix(seqs, p_number = p_use),
-      error = function(e) NULL
+  if (!is.null(counts$c_int)) {
+    pheatmap(
+      counts$c_int,
+      cluster_rows = FALSE, cluster_cols = FALSE,
+      main = sprintf("%s | %s\nIntracellular C-terminal (n=%s)", contrast_name, modif_name, length(seq_list$c_term_int)),
+      color = colorRampPalette(brewer.pal(n = 9, name = "Reds"))(100)
     )
-
-    if (!is.null(cam) && !is.null(cam$amino_acid_count)) {
-      pheatmap(
-        cam$amino_acid_count,
-        main = title_text,
-        cluster_rows = FALSE,
-        cluster_cols = FALSE
-      )
-    }
   }
-
-  # Recursively plot heatmaps for each contrast and direction
-  if (exists("cleavage_sets_by_contrast") && length(cleavage_sets_by_contrast)) {
-
-    for (cn in names(cleavage_sets_by_contrast)) {
-
-      message("Plotting cleavage heatmaps for contrast: ", cn)
-
-      dirs <- cleavage_sets_by_contrast[[cn]]
-      for (dir_name in c("upregulated", "downregulated")) {
-
-        seqs <- dirs[[dir_name]]
-        nr_seqs <- length(seqs)
-
-        if (!is.null(seqs) && length(seqs)) {
-          plot_cleavage_heatmap(
-            seqs,
-            paste0(
-              "Cleavage heatmap: ", dir_name,
-              " (semi N+C) — ", cn,
-              " (", nr_seqs, " sequences)"
-            ),
-            p_num = 10,
-            min_n = 1
-          )
-        }
-
-      }
-    }
-  } else {
-    message("cleavage_sets_by_contrast not available or empty; skipping cleavage heatmaps.")
+  if (!is.null(counts$c_ext)) {
+    pheatmap(
+      counts$c_ext,
+      cluster_rows = FALSE, cluster_cols = FALSE,
+      main = sprintf("%s | %s\nExtracellular C-terminal (n=%s)", contrast_name, modif_name, length(seq_list$c_term_ext)),
+      color = colorRampPalette(brewer.pal(n = 9, name = "Blues"))(100)
+    )
   }
-
-} else if (isTRUE(cleavage_available)) {
-  message("TermineR::cleavage_area_matrix not available; skipping cleavage heatmaps.")
+  if (!is.null(counts$n_int)) {
+    pheatmap(
+      counts$n_int,
+      cluster_rows = FALSE, cluster_cols = FALSE,
+      main = sprintf("%s | %s\nIntracellular N-terminal (n=%s)", contrast_name, modif_name, length(seq_list$n_term_int)),
+      color = colorRampPalette(brewer.pal(n = 9, name = "Greens"))(100)
+    )
+  }
+  if (!is.null(counts$n_ext)) {
+    pheatmap(
+      counts$n_ext,
+      cluster_rows = FALSE, cluster_cols = FALSE,
+      main = sprintf("%s | %s\nExtracellular N-terminal (n=%s)", contrast_name, modif_name, length(seq_list$n_term_ext)),
+      color = colorRampPalette(brewer.pal(n = 9, name = "Purples"))(100)
+    )
+  }
 }
+
+# Iterate over contrasts and nterm_modif elements
+purrr::iwalk(
+  cleavage_sequences_by_contrast,
+  function(modif_list, contrast_nm) {
+    purrr::iwalk(
+      modif_list,
+      function(seq_list, modif_nm) {
+        plot_cleavage_heatmaps(seq_list, contrast_name = contrast_nm, modif_name = modif_nm)
+      }
+    )
+  }
+)
 ```
 
-## Sequence Logos (dagLogo)
+## Sequence Logos
 
 ```{r sequence_logos}
 #| fig-width: 8
 #| fig-height: 5
 
-# Use dagLogo to generate sequence logos around cleavage sites
-if (isTRUE(cleavage_available) && requireNamespace("dagLogo", quietly = TRUE)) {
-  
-  # Try to locate fasta_location from cache, else fallback to the known mouse FASTA
-  fasta_rds <- file.path(rds_dir, "fasta_location.rds")
+if (!isTRUE(run_sequence_logos)) {
+  message("Sequence logos skipped (run_sequence_logos = FALSE).")
+} else {
+  # Prepare proteome for dagLogo analysis
+  proteome <- prepareProteome(fasta = fasta_location, species = "Homo sapiens")
 
-  if (file.exists(fasta_rds)) {
+  # Function to generate dagLogo if sufficient sequences
+  generate_daglogo <- function(sequences, title_text, min_seq = 5) {
+    if (length(sequences) >= min_seq) {
+      set.seed(404)
 
-    fasta_location <- read_rds(fasta_rds)
+      seqs_4ice <- formatSequence(seq = sequences, proteome = proteome)
 
-  } else {
+      seqs_4ice_ztest <- buildBackgroundModel(
+        seqs_4ice,
+        model = "any",
+        background = "wholeProteome",
+        proteome = proteome,
+        testType = "ztest"
+      )
 
-    fasta_location <- here("data/ebi_mus_musculus_canonical_proteome_1gene_1protein_2023_03_release_plus_irts.fasta")
-    message("Using fallback FASTA location: ", fasta_location)
-  }
+      seqs_4ice_ztest_dau <- testDAU(seqs_4ice, dagBackground = seqs_4ice_ztest)
 
-  if (is.character(fasta_location) && file.exists(fasta_location)) {
-    # Prepare proteome reference
-    proteome <- dagLogo::prepareProteome(fasta = fasta_location, species = "Mus musculus")
-
-    # Function to generate dagLogo if sufficient sequences
-    generate_daglogo <- function(sequences, title_text, min_seq = 5) {
-
-      if (length(sequences) >= min_seq) {
-        set.seed(404)
-        seqs_4ice <- dagLogo::formatSequence(seq = sequences, proteome = proteome)
-        seqs_4ice_bg <- dagLogo::buildBackgroundModel(
-          seqs_4ice,
-          model = "any",
-          background = "wholeProteome",
-          proteome = proteome,
-          testType = "ztest"
+      dagLogo(
+        seqs_4ice_ztest_dau,
+        labels = c(
+          "P10", "P9", "P8", "P7", "P6", "P5", "P4", "P3", "P2", "P1",
+          "P1'", "P2'", "P3'", "P4'", "P5'", "P6'", "P7'", "P8'", "P9'", "P10'"
         )
-        seqs_4ice_dau <- dagLogo::testDAU(seqs_4ice, dagBackground = seqs_4ice_bg)
-        # Return the ggplot produced by dagLogo; knitr will print it
-        dagLogo::dagLogo(
-          seqs_4ice_dau,
-          labels = c("P10", "P9", "P8", "P7", "P6", "P5", "P4", "P3", "P2", "P1",
-                     "P1'", "P2'", "P3'", "P4'", "P5'", "P6'", "P7'", "P8'", "P9'", "P10'")
-        )
-      } else {
-
-        # Fallback plot when sequence count is insufficient
-        plot.new()
-
-        text(0.5, 0.5, paste0(title_text, "\nInsufficient sequences (n=", length(sequences), ")"),
-             cex = 1.2, adj = 0.5)
-
-        invisible(NULL)
-      }
-    }
-
-    # Render logos using the same sequence sets used for heatmaps, per contrast and direction
-    if (exists("cleavage_sets_by_contrast") && length(cleavage_sets_by_contrast)) {
-
-      for (cn in names(cleavage_sets_by_contrast)) {
-
-        dirs <- cleavage_sets_by_contrast[[cn]]
-
-        for (dir_name in c("upregulated", "downregulated")) {
-
-          seqs <- dirs[[dir_name]]
-          nr_seqs <- length(seqs)
-          if (!is.null(seqs) && nr_seqs > 0) {
-            print(
-              generate_daglogo(
-                seqs,
-                paste0("dagLogo: ", dir_name, " — ", cn, " (", nr_seqs, " sequences)")
-              )
-            )
-          }
-
-        }
-      }
+      )
     } else {
-
-      message("cleavage_sets_by_contrast not available or empty; skipping dagLogo sequence logos.")
-
+      plot.new()
+      text(
+        0.5,
+        0.5,
+        paste0(title_text, "\nInsufficient sequences (n=", length(sequences), ")"),
+        cex = 1.2,
+        adj = 0.5
+      )
     }
-
-  } else {
-    message("FASTA file for dagLogo not found; skipping sequence logos.")
   }
 
-} else if (isTRUE(cleavage_available)) {
-  message("Package dagLogo not installed; skipping sequence logos.")
+  # Helper to choose contrasts/modifs to plot
+  contrast_keys <- names(cleavage_sequences_by_contrast)
+  if (!is.null(sequence_logo_contrasts)) {
+    contrast_keys <- intersect(contrast_keys, sequence_logo_contrasts)
+  }
+
+  purrr::iwalk(
+    cleavage_sequences_by_contrast[contrast_keys],
+    function(modif_list, contrast_nm) {
+      modif_keys <- names(modif_list)
+      if (!is.null(sequence_logo_nterm_modifs)) {
+        modif_keys <- intersect(modif_keys, sequence_logo_nterm_modifs)
+      }
+
+      purrr::iwalk(
+        modif_list[modif_keys],
+        function(seq_list, modif_nm) {
+          title_prefix <- paste0(contrast_nm, " | ", modif_nm)
+
+          generate_daglogo(
+            seq_list$c_term_int,
+            paste0(title_prefix, " — Intracellular C-terminal")
+          )
+          generate_daglogo(
+            seq_list$c_term_ext,
+            paste0(title_prefix, " — Extracellular C-terminal")
+          )
+          generate_daglogo(
+            seq_list$n_term_int,
+            paste0(title_prefix, " — Intracellular N-terminal")
+          )
+          generate_daglogo(
+            seq_list$n_term_ext,
+            paste0(title_prefix, " — Extracellular N-terminal")
+          )
+        }
+      )
+    }
+  )
 }
 ```
 
 # Histogram of Cleavage Positions
 
-```{r cleavage_positions}
-# Prepare data for cleavage position analysis
-upregulated_features_pos <- all_results %>%
-  filter(
-    contrast == "Tumor_vs_NAT",
-    regulation == "upregulated",
-    processing_type == "not_canonical"
-  ) %>%
-  mutate(
-    m_in_p1_or_p1_prime = case_when(
-      str_detect(p1_residue, "M") | str_detect(p1_prime_residue, "M") ~ "M in P1 or P1'",
-      TRUE ~ "no M in P1 or P1'"
-    ),
-    normalized_cleavage_position = p1_prime_position / protein_length * 100
-  ) %>%
-  filter(!is.na(normalized_cleavage_position))
-```
-
-```{r cleavage_histogram}
+```{r cleavage_histograms}
 #| fig-width: 8
 #| fig-height: 7
 
 if (all(c("p1_prime_position", "protein_length", "dataset", "contrast") %in% names(all_results))) {
 
-  for (contrast in unique(all_results$contrast)) {
+  build_cleavage_histogram <- function(df, contrast_name, title_text, facet_col) {
+    if (nrow(df) == 0) return(NULL)
 
-    message("Plotting cleavage position histogram for contrast: ", contrast)
-
-  upregulated_features_pos <- all_results %>%
-    dplyr::filter(
-      dataset == "protnorm_with_lost",
-      contrast == contrast,
-      regulation != "not_significant",
-      processing_type == "not_canonical",
-      !is.na(p1_prime_position),
-      !is.na(protein_length),
-      protein_length > 0
-    ) %>%
-    dplyr::mutate(
-      normalized_cleavage_position = p1_prime_position / protein_length * 100,
-      m_in_p1_or_p1_prime = case_when(
-        str_detect(p1_residue, "M") | str_detect(p1_prime_residue, "M") ~ "M in P1 or P1'",
-        TRUE ~ "no M in P1 or P1'")
-      )
-
-    p <- ggplot(
-      upregulated_features_pos, 
-      aes(x = normalized_cleavage_position)) +
+    ggplot(df, aes(x = normalized_cleavage_position)) +
       geom_histogram(bins = 50, fill = "steelblue", color = "black", alpha = 0.7) +
-      facet_grid(intra_or_extra ~ m_in_p1_or_p1_prime) +
+      facet_grid(nterm_modif + .data[[facet_col]] ~ m_in_p1_or_p1_prime) +
       labs(
-        title = "Histogram of Cleavage Site Positions",
-        subtitle = contrast,
+        title = title_text,
+        subtitle = contrast_name,
         x = "Normalized Cleavage Site Position (%)",
         y = "Count"
       ) +
@@ -772,14 +1179,145 @@ if (all(c("p1_prime_position", "protein_length", "dataset", "contrast") %in% nam
         plot.title = element_text(size = 14),
         plot.subtitle = element_text(size = 12)
       )
-
-  print(p)
-
   }
 
-  } else {
-    message("Required columns for cleavage position histogram not found; skipping.")
+  # Container for plots
+  cleavage_histogram_plots <- list()
+
+  mode_specs <- list(
+    updown = list(
+      title = "Histogram of Cleavage Site Positions\nUpregulated and Downregulated Non-canonical Features",
+      df_fn = function(cn) {
+        volcano_data_after_w_go %>%
+          dplyr::filter(
+            contrast == cn,
+            regulation != "not_significant",
+            processing_type == "not_canonical",
+            !is.na(p1_prime_position),
+            !is.na(protein_length),
+            protein_length > 0
+          ) %>%
+          dplyr::mutate(
+            normalized_cleavage_position = p1_prime_position / protein_length * 100,
+            m_in_p1_or_p1_prime = case_when(
+              str_detect(p1_residue, "M") | str_detect(p1_prime_residue, "M") ~ "M in P1 or P1'",
+              TRUE ~ "no M in P1 or P1'"
+            )
+          )
+      },
+      facet_col = "extracellular_or_cytoplasm"
+    ),
+    upregulated = list(
+      title = "Histogram of Cleavage Site Positions\nUpregulated Non-canonical Features",
+      df_fn = function(cn) {
+        volcano_data_after_w_go %>%
+          dplyr::filter(
+            dataset == "protnorm_with_lost",
+            contrast == cn,
+            regulation == "upregulated",
+            processing_type == "not_canonical",
+            !is.na(p1_prime_position),
+            !is.na(protein_length),
+            protein_length > 0
+          ) %>%
+          dplyr::mutate(
+            normalized_cleavage_position = p1_prime_position / protein_length * 100,
+            m_in_p1_or_p1_prime = case_when(
+              str_detect(p1_residue, "M") | str_detect(p1_prime_residue, "M") ~ "M in P1 or P1'",
+              TRUE ~ "no M in P1 or P1'"
+            )
+          )
+      },
+      facet_col = "extracellular_or_cytoplasm"
+    ),
+    downregulated = list(
+      title = "Histogram of Cleavage Site Positions\nDownregulated Non-canonical Features",
+      df_fn = function(cn) {
+        volcano_data_after_w_go %>%
+          dplyr::filter(
+            dataset == "protnorm_with_lost",
+            contrast == cn,
+            regulation == "downregulated",
+            processing_type == "not_canonical",
+            !is.na(p1_prime_position),
+            !is.na(protein_length),
+            protein_length > 0
+          ) %>%
+          dplyr::mutate(
+            normalized_cleavage_position = p1_prime_position / protein_length * 100,
+            m_in_p1_or_p1_prime = case_when(
+              str_detect(p1_residue, "M") | str_detect(p1_prime_residue, "M") ~ "M in P1 or P1'",
+              TRUE ~ "no M in P1 or P1'"
+            )
+          )
+      },
+      facet_col = "extracellular_or_cytoplasm"
+    ),
+    all_features = list(
+      title = "Histogram of Cleavage Site Positions\nAll Non-canonical Features (incl. non-DA)",
+      df_fn = function(cn) {
+        volcano_data_after_w_go %>%
+          dplyr::filter(
+            dataset == "protnorm_with_lost",
+            contrast == cn,
+            processing_type == "not_canonical",
+            !is.na(p1_prime_position),
+            !is.na(protein_length),
+            protein_length > 0
+          ) %>%
+          dplyr::mutate(
+            normalized_cleavage_position = p1_prime_position / protein_length * 100,
+            m_in_p1_or_p1_prime = case_when(
+              str_detect(p1_residue, "M") | str_detect(p1_prime_residue, "M") ~ "M in P1 or P1'",
+              TRUE ~ "no M in P1 or P1'"
+            )
+          )
+      },
+      facet_col = "extracellular_or_cytoplasm"
+    )
+  )
+
+  for (contrast in unique(volcano_data_after$contrast)) {
+
+    message("Building cleavage histograms for contrast: ", contrast)
+
+    for (mode_name in names(mode_specs)) {
+      spec <- mode_specs[[mode_name]]
+      df_plot <- spec$df_fn(contrast)
+
+      facet_col <- spec$facet_col
+      if (!facet_col %in% names(df_plot)) {
+        facet_col <- if ("intra_or_extra" %in% names(df_plot)) "intra_or_extra" else "nterm_modif"
+      }
+
+      p <- build_cleavage_histogram(df_plot, contrast, spec$title, facet_col)
+
+      if (!is.null(p)) {
+        plot_key <- paste(contrast, mode_name, sep = "__")
+        cleavage_histogram_plots[[plot_key]] <- p
+      }
+    }
   }
+
+} else {
+  message("Required columns for cleavage position histogram not found; skipping.")
+}
+```
+
+```{r}
+#| fig-width: 8
+#| fig-height: 7
+
+if (length(cleavage_histogram_plots) > 0) {
+  purrr::iwalk(
+    cleavage_histogram_plots,
+    function(plot_obj, plot_name) {
+      print(plot_obj)
+    }
+  )
+} else {
+  message("No cleavage histogram plots were generated.")
+}
 ```
 
 # Save Plots and Summary
@@ -788,7 +1326,7 @@ if (all(c("p1_prime_position", "protein_length", "dataset", "contrast") %in% nam
 # Save summary statistics
 write_tsv(
   summary_stats,
-  file.path(results_dir, paste0(pre_fix, "summary_statistics.tsv"))
+  file.path(results_dir, paste0(pre_fix, "_summary_statistics.tsv"))
 )
 
 message("Visualization analysis complete. Results saved.")
@@ -798,4 +1336,8 @@ message("Visualization analysis complete. Results saved.")
 
 ```{r session_info}
 sessionInfo()
+```
+
+```{r}
+str(go_groups_df$protnorm_with_lost@result)
 ```

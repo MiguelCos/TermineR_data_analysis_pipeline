@@ -1,5 +1,5 @@
 ---
-title: "TermineR Exploratory Analysis"
+title: "TermineR Data Preparation"
 author: "Your Name"
 format:
   html:
@@ -16,8 +16,8 @@ execute:
   eval: true
   echo: false
   error: false
-  warning: false
-  message: false
+  warning: true
+  message: true
   cache: true
 ---
 
@@ -65,7 +65,7 @@ search_engine <- "diann"  # Options: "diann", "fragpipe_tmt", "fragpipe_lf", "fr
 # === DATA LOCATIONS (adjust based on search engine) ===
 # EXPERIMENT-SPECIFIC: update input data paths for your study.
 # For DIA-NN
-diann_report_location <- here("data/search_fp_semi_nterm_acetyl_all_samples_3/dia-quant-output/report.tsv")  # Can be .parquet or .tsv
+diann_report_location <- here("diann_report_or_parquet_location/.../report.tsv")  # Can be .parquet or .tsv
 
 # For FragPipe TMT
 fragpipe_parent_dir <- NULL #here("data/2024_05_semi_tryptic_search_fp21")  # Directory containing mix folders
@@ -116,7 +116,7 @@ pre_fix <- "xx000_projectname_analysis_type"  # Prefix for output files
 # === PLOT PARAMETERS ===
 # EXPERIMENT-SPECIFIC: adjust plot dimensions for your report.
 plot_width <- 10
-plot_height <- 10
+plot_height <- 5
 side_by_side_scale <- 2.0  # wider figures when arranging multiple plots
 plot_dpi <- 300
 
@@ -131,20 +131,15 @@ pca_use_interest_only <- FALSE
 
 # Toggle: run ComBat batch-correction? Set to TRUE to perform ComBat. Note: batch groups default to experimental_design$plex
 do_batch_correction <- FALSE
-
-# Toggle: run imputation diagnostic plots (can be slow for large datasets)
-run_imputation_diagnostics <- FALSE
-
-# Optional guardrail: skip cached imputation plots if TSV is large (in MB)
-imputation_tsv_max_mb <- 50
 ```
 
 # Data Loading and Annotation
 
 ```{r load_data}
 #| cache: true
+#| message: true
 # Load data based on search engine
-rds_path_data <- file.path(rds_dir, paste0(pre_fix, search_engine, "_data.rds"))
+rds_path_data <- file.path(rds_dir, paste0("pre_search_", search_engine, "_data.rds"))
 
 if (file.exists(rds_path_data)) {
 
@@ -231,17 +226,13 @@ if (file.exists(rds_path_data)) {
 
 # Load experimental design (adapt based on search engine
 # For other search engines, load external annotation file
-  experimental_design <- read_delim(location_annotation) %>%
+experimental_design <- read_delim(location_annotation) %>%
     mutate(
       measurement_batch = as.factor(measurement_batch)
-    ) %>% 
-    # exclude samples not part of the final results/search
-    filter(
-      sample %in% str_subset(colnames(df_from_search), paste0("^", instrument))
     )
 
-# Load protein to gene mapping with caching (aligned to data_prep_prelim outputs)
-rds_path_prot2gene <- file.path(rds_dir, paste0(pre_fix, search_engine, "_prot2gene.rds"))
+# Load protein to gene mapping with caching
+rds_path_prot2gene <- file.path(rds_dir, paste0("pre_search_", search_engine, "_prot2gene.rds"))
 
 if (file.exists(rds_path_prot2gene)) {
 
@@ -268,7 +259,7 @@ if (file.exists(rds_path_prot2gene)) {
 ```{r annotate_peptides}
 #| cache: true
 # Annotate neo-termini
-rds_path_annotated <- file.path(rds_dir, paste0(pre_fix, "_annotated_data.rds"))
+rds_path_annotated <- file.path(rds_dir, "pre_search_annotated_data.rds")
 
 if (file.exists(rds_path_annotated)) {
 
@@ -517,78 +508,6 @@ annotated_df_quant$nterm_modif %>% table()
 # Calculate identifications by specificity and refined processing type (excluding specific peptides)
 ids_by_specificity_refined <- annotated_df_quant %>%
   filter(specificity %in% c("semi_Cterm", "semi_Nterm")) %>%
-  dplyr::select(specificity, processing_type, starts_with(instrument)) %>%
-  pivot_longer(cols = starts_with(instrument),
-               names_to = "sample",
-               values_to = "value") %>%
-  group_by(specificity, processing_type, sample) %>%
-  summarise(n_identifications = sum(!is.na(value)), .groups = 'drop') %>%
-  left_join(
-    experimental_design, 
-    by = "sample")
-
-# Calculate median identifications by refined processing type
-median_ids_refined_processing <- ids_by_specificity_refined %>%
-  group_by(specificity, processing_type, condition) %>%
-  summarise(
-    median_ids = median(n_identifications),
-    mean_ids = mean(n_identifications),
-    sd_ids = sd(n_identifications),
-    n_samples = n(),
-    .groups = 'drop'
-  )
-
-# Plot median identifications with facet_grid (horizontal bars)
-plot_median_refined <- median_ids_refined_processing %>%
-  ggplot(aes(x = median_ids, 
-             y = condition,
-             fill = condition)) +
-  geom_col() +
-  geom_errorbar(aes(xmin = median_ids - sd_ids, 
-                    xmax = median_ids + sd_ids),
-                width = 0.3, alpha = 0.7) +
-  geom_text(aes(label = round(median_ids, 0)), 
-            hjust = -0.01, vjust = -0.2, size = 2.5) +
-  facet_grid(
-    processing_type ~ specificity, 
-    scales = "free_x") +
-  scale_x_continuous(expand = expansion(mult = c(0, 0.1))) +
-  labs(
-    title = "Median Number of Identifications by Refined Processing Type\nBefore Sparcity Reduction and Imputation",
-    subtitle = "Semi-specific peptides only, grouped by specificity and processing type",
-    x = "Median number of identifications",
-    y = "Condition",
-    fill = "Condition"
-  ) +
-  theme_minimal() +
-  theme(
-    axis.text.y = element_text(angle = 0, hjust = 1),
-    legend.position = "bottom",
-    strip.text = element_text(size = 9)
-  )
-
-print(plot_median_refined)
-
-# Display summary table
-knitr::kable(median_ids_refined_processing, 
-             caption = "Summary Statistics: Identifications by Refined Processing Type and Condition",
-             digits = 1) %>%
-  kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"))
-```
-
-# Median Identifications by Processing Type and N-term modification
-
-Performed the search only N-term semispecific to make it faster and because of our focus on N-terminal acetylation.
-
-
-```{r median_ids_processing_type_nterm_modif}
-#| fig-width: !expr plot_width
-#| fig-height: !expr plot_height
-#| cache: true
-
-# Calculate identifications by specificity and refined processing type (excluding specific peptides)
-ids_by_specificity_refined <- annotated_df_quant %>%
-  filter(specificity %in% c("semi_Cterm", "semi_Nterm")) %>%
   dplyr::select(specificity, processing_type, nterm_modif, starts_with(instrument)) %>%
   pivot_longer(cols = starts_with(instrument),
                names_to = "sample",
@@ -653,15 +572,13 @@ knitr::kable(median_ids_refined_processing,
 ```{r missing_values}
 #| fig-width: !expr plot_width
 #| fig-height: !expr plot_height
-#| cache: true
+#| cache: false
 
 # Analyze missing value patterns
 missing_analysis <- annotated_df_quant %>%
   dplyr::select(starts_with(instrument)) %>%
   vis_miss(warn_large_data = FALSE) +
   labs(title = "Missing Value Patterns")
-
-print(missing_analysis)
 
 # Calculate missing value statistics
 missing_stats <- annotated_df_quant %>%
@@ -673,7 +590,10 @@ missing_stats <- annotated_df_quant %>%
 missing_plot <- missing_stats %>%
   ggplot(aes(x = sample, y = missing_count, fill = condition)) +
   geom_col() +
-  labs(title = "Missing Values by Sample", x = "Sample", y = "Missing Count") +
+  labs(
+    title = "Missing Values by Sample", 
+    x = "Sample", 
+    y = "Missing Count") +
   theme_minimal() +
   theme(axis.text.x = element_text(angle = 45, hjust = 1))
 
@@ -683,12 +603,13 @@ print(missing_plot)
 # Imputation and Data Preparation
 
 ```{r imputation}
-#| cache: true
+#| cache: false
+#| message: true
 #| fig-width: !expr plot_width
 #| fig-height: !expr plot_height 
 
 # Prepare data for downstream analysis
-rds_path_prepared <- file.path(rds_dir, paste0(pre_fix, "_prepared_n_imputed_data.rds"))
+rds_path_prepared <- file.path(rds_dir, "pre_search_prepared_n_imputed_data.rds")
 
 if (file.exists(rds_path_prepared)) {
 
@@ -723,37 +644,43 @@ if (file.exists(rds_path_prepared)) {
     message("Retained ", nrow(quant_matrix), " complete features out of ", 
             nrow(annotated_df_quant), " total features")
 
+    # Create SummarizedExperiment object
+    se_pept_imp_raw <- SummarizedExperiment(
+      assays = list(counts = quant_matrix),
+      colData = experimental_design,
+      rowData = annotation_data
+    )
+
   } else {
+
+    # Prepare annotation data for non-TMT workflows
+    annotation_data <- annotated_df_quant %>%
+      dplyr::select(-starts_with(instrument))
+
+    # Create SummarizedExperiment object
+    se_pept_raw <- SummarizedExperiment(
+      assays = list(counts = quant_matrix),
+      colData = experimental_design,
+      rowData = annotation_data
+    )
 
     # For other data types, perform imputation as before
     message("Non-TMT data: performing imputation...")
-    annotation_data <- annotated_df_quant %>%
-      dplyr::select(-starts_with(instrument))
-  }
-  
-  # Create SummarizedExperiment object
-  se_pept_imp_raw <- SummarizedExperiment(
-    assays = list(counts = quant_matrix),
-    colData = experimental_design,
-    rowData = annotation_data
-  )
-  
-  # Apply imputation only for non-TMT data
-  if (search_engine != "fragpipe_tmt") {
+
     se_pept_imp_raw_imputation_list <- terminer_imputation(
-      se = se_pept_imp_raw,
+      se = se_pept_raw,
       min_fraction_condition = missing_accepted,
       tune_sigma = 1,
       tune_quantile = 1e-7
     )
-    
+
     se_pept_imp_raw <- se_pept_imp_raw_imputation_list$se
 
     # get summary table of missingness and imputation approach by feature observation
     imputation_summary_table <- se_pept_imp_raw_imputation_list$imputation_summary_table
 
     write_tsv(imputation_summary_table, 
-           file.path(here("results"), paste0(pre_fix, "_imputation_summary_table.tsv")))
+               file.path(here("results"), paste0(pre_fix, "imputation_summary_table.tsv")))
 
     # Visualization: reconstruct long imputed dataframe and plot summaries (conditional)
     if (exists("imputation_summary_table") && is.data.frame(imputation_summary_table) && nrow(imputation_summary_table) > 0) {
@@ -764,12 +691,18 @@ if (file.exists(rds_path_prepared)) {
         tibble::rownames_to_column(var = "nterm_modif_peptide")
 
       df_example_partial_missing_imp <- imputed_mat_df %>%
-        tidyr::pivot_longer(cols = -nterm_modif_peptide, names_to = "sample", values_to = "Abundance") %>%
-        dplyr::left_join(imputation_summary_table, by = c("nterm_modif_peptide", "sample")) %>%
+        tidyr::pivot_longer(
+          cols = -nterm_modif_peptide,
+           names_to = "sample", 
+           values_to = "Abundance") %>%
+        dplyr::left_join(
+          imputation_summary_table, 
+          by = c("nterm_modif_peptide", "sample")) %>%
         dplyr::left_join(experimental_design, by = "sample")
 
       # Only plot if imputation method column present
       if ("imputation_method" %in% colnames(df_example_partial_missing_imp)) {
+        message("Creating imputation diagnostic plots...")
         try({
           # Histogram by condition and imputation method
           p_hist_imp <- df_example_partial_missing_imp %>%
@@ -846,10 +779,16 @@ if (file.exists(rds_path_prepared)) {
     } else {
       message("No imputation summary available — skipping imputation visualizations.")
     }
-  }
+
+  }  # end non-TMT branch
   
   write_rds(se_pept_imp_raw, rds_path_prepared)
+  write_rds(se_pept_imp_raw_imputation_list, file.path(here("rds"), paste0(pre_fix, "_imputation_list.rds")))
 }
+```
+
+```{r}
+assay(se_pept_imp_raw)[1:10, 1:10]
 ```
 
 ```{r imputation_plots_from_cache}
@@ -861,21 +800,9 @@ if (file.exists(rds_path_prepared)) {
 # Recreate them from the saved TSV if needed.
 if (!exists("imputation_plots_generated") || !isTRUE(imputation_plots_generated)) {
 
-  if (!isTRUE(run_imputation_diagnostics)) {
-    message("Imputation diagnostics disabled (run_imputation_diagnostics = FALSE). Skipping cached imputation plots.")
-  } else {
-
-  imp_sum_path <- file.path(here("results"), paste0(pre_fix, "_imputation_summary_table.tsv"))
+  imp_sum_path <- file.path(here("results"), paste0(pre_fix, "imputation_summary_table.tsv"))
   
   if (file.exists(imp_sum_path)) {
-
-    tsv_mb <- file.info(imp_sum_path)$size / (1024^2)
-    if (is.finite(tsv_mb) && tsv_mb > imputation_tsv_max_mb) {
-      message(
-        "Imputation summary TSV is large (~", round(tsv_mb, 1), " MB). ",
-        "Skipping cached imputation plots. Increase imputation_tsv_max_mb or set run_imputation_diagnostics = TRUE to force."
-      )
-    } else {
   
     imputation_summary_table_cached <- readr::read_tsv(imp_sum_path, show_col_types = FALSE)
     if (is.data.frame(imputation_summary_table_cached) && nrow(imputation_summary_table_cached) > 0) {
@@ -953,529 +880,6 @@ if (!exists("imputation_plots_generated") || !isTRUE(imputation_plots_generated)
         }, silent = TRUE)
       }
     }
-    }
-  }
   }
 }
-```
-
-# Principal Component Analysis
-
-```{r pca_analysis_1}
-#| fig-width: !expr plot_width
-#| fig-height: !expr plot_height
-#| cache: false
-
-perform_pca_analysis <- function(se_object, title_suffix = "", subtitle = "Visualizing conditions", color_var = "condition") {
-  pca_matrix <- assay(se_object) %>% t() %>% na.omit()
-  
-  pca_result <- prcomp(pca_matrix, scale. = TRUE)
-  
-  pca_df <- data.frame(
-    sample = rownames(pca_result$x),
-    PC1 = pca_result$x[,1],
-    PC2 = pca_result$x[,2]
-  ) %>%
-    left_join(experimental_design, by = "sample")
-  
-  var_exp <- summary(pca_result)$importance[2,]
-  
-  pca_plot <- pca_df %>%
-    ggplot(aes(x = PC1, y = PC2, color = .data[[color_var]])) +
-    geom_point(size = 5) +
-    #stat_ellipse(level = 0.68) +
-    labs(
-      title = paste("PCA Analysis", title_suffix),
-      subtitle = subtitle,
-      x = paste("PC1 -", round(var_exp[1] * 100, 1), "% variance"),
-      y = paste("PC2 -", round(var_exp[2] * 100, 1), "% variance"),
-      color = str_to_title(str_replace_all(color_var, "_", " "))
-    ) +
-    theme_minimal()
-  
-  return(list(plot = pca_plot, data = pca_df, variance = var_exp))
-}
-
-# Optional subsetting for PCA
-se_for_pca <- if (isTRUE(pca_use_interest_only)) {
-  keep <- rowData(se_pept_imp_raw)$is_in_scope_for_interest
-  keep[is.na(keep)] <- FALSE
-  se_pept_imp_raw[keep, , drop = FALSE]
-} else {
-  se_pept_imp_raw
-}
-
-pca_results_1 <- perform_pca_analysis(
-  se_for_pca, 
-  title_suffix = "- Before Batch Correction",
-  subtitle = if (isTRUE(pca_use_interest_only)) "PCA on interesting features" else "Visualizing conditions",
-  color_var = "condition"
-)
-
-print(pca_results_1$plot)
-```
-
-```{r batch_effect_pca}
-pca_results_batch <- perform_pca_analysis(
-  se_for_pca, 
-  title_suffix = "- ",
-  subtitle = if (isTRUE(pca_use_interest_only)) "PCA on interesting features" else "Visualizing batches",
-  color_var = "measurement_batch"
-)
-
-print(pca_results_batch$plot)
-```
-
-# Batch effect correction with ComBat 
-
-```{r}
-#| cache: true
-
-# Perform batch effect correction using ComBat only if requested by the user
-if (isTRUE(do_batch_correction)) {
-
-  # Validate that the expected batch column exists
-  if (!"plex" %in% colnames(experimental_design)) {
-    stop("do_batch_correction is TRUE but 'plex' column not found in experimental_design. Either set do_batch_correction <- FALSE or provide an appropriate batch column named 'plex'.")
-  }
-
-  message("Running ComBat batch correction using experimental_design$plex as batch groups")
-  combat_corrected <- ComBat(
-    dat = assay(se_pept_imp_raw),
-    batch = experimental_design$plex,
-    mod = model.matrix(~ experimental_design$condition)
-  )
-
-  # Create a new SummarizedExperiment with corrected data
-  se_pept_imp_corrected <- SummarizedExperiment(
-    assays = list(counts = combat_corrected),
-    colData = experimental_design,
-    rowData = rowData(se_pept_imp_raw)
-  )
-
-} else {
-  message("do_batch_correction is FALSE — skipping ComBat. If you want to run ComBat, set do_batch_correction <- TRUE. Note: batch groups default to experimental_design$plex.")
-  # Keep the raw imputed SE unchanged when skipping batch correction
-  se_pept_imp_corrected <- se_pept_imp_raw
-}
-```
-
-## PCA Analysis After Batch Correction
-
-```{r pca_after_correction}
-#| fig-width: !expr plot_width
-#| fig-height: !expr plot_height
-#| cache: true
-
-if (isTRUE(do_batch_correction)) {
-
-  # Optional subsetting for PCA on corrected data
-  se_corr_for_pca <- if (isTRUE(pca_use_interest_only)) {
-    keep <- rowData(se_pept_imp_corrected)$is_in_scope_for_interest
-    keep[is.na(keep)] <- FALSE
-    se_pept_imp_corrected[keep, , drop = FALSE]
-  } else {
-    se_pept_imp_corrected
-  }
-
-  pca_corrected_condition <- perform_pca_analysis(
-    se_corr_for_pca, 
-    title_suffix = "- After Batch Correction, non-protein-normalized",
-    subtitle = if (isTRUE(pca_use_interest_only)) "PCA on interesting features" else "Visualizing conditions",
-    color_var = "condition"
-  )
-
-  print(pca_corrected_condition$plot)
-
-} else {
-  message("Skipping PCA 'After Batch Correction' — batch correction disabled (do_batch_correction = FALSE).")
-}
-```
-
-```{r batch_effect_correction}
-#| fig-width: !expr plot_width
-#| fig-height: !expr plot_height
-#| cache: true
-
-if (isTRUE(do_batch_correction)) {
-  # Optional subsetting for PCA on corrected data (batch)
-  se_corr_for_pca_batch <- if (isTRUE(pca_use_interest_only)) {
-    keep <- rowData(se_pept_imp_corrected)$is_in_scope_for_interest
-    keep[is.na(keep)] <- FALSE
-    se_pept_imp_corrected[keep, , drop = FALSE]
-  } else {
-    se_pept_imp_corrected
-  }
-
-  pca_corrected_batch <- perform_pca_analysis(
-    se_corr_for_pca_batch, 
-    title_suffix = "- After Batch Correction\nnon-protein-normalized",
-    subtitle = if (isTRUE(pca_use_interest_only)) "PCA on interesting features" else "Visualizing batch effects",
-    color_var = "plex"
-  )
-
-  print(pca_corrected_batch$plot)
-
-} else {
-  message("Skipping PCA 'After Batch Correction (batch view)' — batch correction disabled (do_batch_correction = FALSE).")
-}
-```
-
-# Protein-level normalization and SE creation
-
-```{r protein_level_normalization}
-#| cache: true
-# Build protein-normalized peptide abundances and paired SummarizedExperiment objects
-# This enables auditing of peptides excluded by protein-level normalization.
-
-# 1) Build a long peptide table from corrected data with required annotations
-#    Use non-log2 (linear) abundances for protein-level normalization
-pept_q_raw <- (2 ^ assay(se_pept_imp_corrected)) %>%
-  as.data.frame() %>%
-  rownames_to_column("nterm_modif_peptide") %>%
-  left_join(
-    as.data.frame(rowData(se_pept_imp_corrected)) %>%
-      dplyr::select(
-        nterm_modif_peptide,
-        peptide,
-        protein,
-        nterm_modif,
-        specificity
-      ),
-    by = "nterm_modif_peptide"
-  ) %>%
-  dplyr::relocate(
-    nterm_modif_peptide,
-    peptide,
-    protein,
-    nterm_modif,
-    specificity
-  )
-
-pept_q_raw_annot <- pept_q_raw %>%
-  dplyr::select(
-    nterm_modif_peptide,
-    peptide,
-    protein,
-    nterm_modif,
-    specificity
-  )
-
-# remove samples from experiment
-
-
-# 2) Run peptide-to-protein normalization
-#    Using experimental_design as the sample annotation
-protein_normalized_peptides <- peptide2protein_normalization(
-  peptides = pept_q_raw,
-  annot = experimental_design,
-  peptide_annot = pept_q_raw_annot,
-  summarize_by_specificity = TRUE
-)
-
-
-# 3) Prepare wide matrix of protein-normalized peptide abundances
-prot_norm_wide <- protein_normalized_peptides$protein_normalized_pepts_scaled
-
-# Determine which columns correspond to samples
-prefixed_cols <- paste0("fraction_int_peptide2prot_", experimental_design$sample)
-
-sample_cols <- intersect(colnames(prot_norm_wide), prefixed_cols)
-
-if (length(sample_cols) == 0) {
-  # Fallback: maybe already de-prefixed
-  sample_cols <- intersect(colnames(prot_norm_wide), experimental_design$sample)
-}
-
-mat_df <- prot_norm_wide %>%
-  dplyr::select(nterm_modif_peptide, all_of(sample_cols))
-
-# Remove prefix if present so column names match experimental_design$sample
-colnames(mat_df) <- colnames(mat_df) %>%
-  stringr::str_remove("^fraction_int_peptide2prot_")
-
-# Convert to matrix and order columns to match design
-mat_prot_norm <- mat_df %>%
-  column_to_rownames("nterm_modif_peptide") %>%
-  as.matrix()
-
-common_samples <- intersect(colnames(mat_prot_norm), experimental_design$sample)
-
-mat_prot_norm <- mat_prot_norm[, common_samples, drop = FALSE]
-
-# Align colData to the matrix columns and set rownames to sample IDs
-design_common <- experimental_design %>%
-  dplyr::filter(sample %in% common_samples) %>%
-  dplyr::arrange(match(sample, common_samples))
-
-rownames(design_common) <- design_common$sample
-
-# Ensure columns strictly follow design order
-mat_prot_norm <- mat_prot_norm[, design_common$sample, drop = FALSE]
-
-# 4) Build annotation for protein-normalized rows by merging back rowData
-prot_norm_join <- mat_df %>%
-  left_join(
-    as.data.frame(rowData(se_pept_imp_corrected)),
-    by = "nterm_modif_peptide"
-  )
-
-rowdata_cols <- setdiff(colnames(prot_norm_join), colnames(mat_df))
-
-annot_prot_norm <- prot_norm_join %>%
-  dplyr::select(nterm_modif_peptide, dplyr::all_of(rowdata_cols)) %>%
-  distinct()
-
-# Ensure annotation order matches matrix rows
-annot_prot_norm <- annot_prot_norm %>%
-  dplyr::filter(nterm_modif_peptide %in% rownames(mat_prot_norm)) %>%
-  arrange(match(nterm_modif_peptide, rownames(mat_prot_norm))) %>%
-  mutate(protein_normalization = "protein_normalized")
-  
-# Set rownames to match assay rownames
-rownames(annot_prot_norm) <- annot_prot_norm$nterm_modif_peptide
-
-# 5) Identify peptides lost by protein-level normalization
-all_features <- rownames(assay(se_pept_imp_corrected))
-lost_features <- setdiff(all_features, rownames(mat_prot_norm))
-
-n_lost <- length(lost_features)
-message("Protein-level normalization: lost ", n_lost, " peptides out of ", length(all_features))
-
-# 6) For lost peptides, bring their original corrected intensities and annotate
-quant_lost_df <- assay(se_pept_imp_corrected)[lost_features, , drop = FALSE] %>%
-  as.data.frame() %>%
-  rownames_to_column("nterm_modif_peptide")
-
-annot_lost <- as.data.frame(rowData(se_pept_imp_corrected)) %>%
-  dplyr::filter(nterm_modif_peptide %in% lost_features) %>%
-  mutate(protein_normalization = "not_protein_normalized")
-
-# 7) Combine protein-normalized peptides with the lost ones (kept as original corrected intensities)
-prot_norm_df <- mat_prot_norm %>%
-  as.data.frame() %>%
-  rownames_to_column("nterm_modif_peptide")
-
-combined_df <- bind_rows(prot_norm_df, quant_lost_df)
-
-mat_prot_norm_with_lost <- combined_df %>%
-  column_to_rownames("nterm_modif_peptide") %>%
-  as.matrix()
-
-annot_with_lost <- bind_rows(annot_prot_norm, annot_lost) %>%
-  arrange(match(nterm_modif_peptide, rownames(mat_prot_norm_with_lost)))
-
-# Constrain columns to design and set row/col alignment
-mat_prot_norm_with_lost <- mat_prot_norm_with_lost[, design_common$sample, drop = FALSE]
-
-rownames(annot_with_lost) <- annot_with_lost$nterm_modif_peptide
-
-# 8) Create SE objects
-se_pept_protnorm_pure <- SummarizedExperiment(
-  assays = list(counts = mat_prot_norm),
-  colData = design_common,
-  rowData = annot_prot_norm
-)
-
-se_pept_protnorm_with_lost <- SummarizedExperiment(
-  assays = list(counts = mat_prot_norm_with_lost),
-  colData = design_common,
-  rowData = annot_with_lost
-)
-
-# Non-protein-normalized SE aligned to the same sample set/order
-counts_nonprot <- assay(se_pept_imp_corrected)[, design_common$sample, drop = FALSE]
-
-rowdata_nonprot <- as.data.frame(rowData(se_pept_imp_corrected)) %>%
-  mutate(protein_normalization = "none") %>%
-  dplyr::filter(nterm_modif_peptide %in% rownames(counts_nonprot)) %>%
-  arrange(match(nterm_modif_peptide, rownames(counts_nonprot)))
-
-rownames(rowdata_nonprot) <- rowdata_nonprot$nterm_modif_peptide
-
-se_pept_non_protnorm <- SummarizedExperiment(
-  assays = list(counts = counts_nonprot),
-  colData = design_common,
-  rowData = rowdata_nonprot
-)
-
-# Clean up large temporaries
-rm(pept_q_raw, pept_q_raw_annot, prot_norm_wide, mat_df, prot_norm_join,
-   prot_norm_df, combined_df, quant_lost_df, annot_lost)
-   
-invisible(gc())
-```
-
-```{r}
-# get protein quant
-mat_prot_quant <- protein_normalized_peptides$summarized_protein_abundance_scaled %>%  
-  dplyr::select(
-    protein,
-    matches("_prot")
-  ) %>%
-  column_to_rownames("protein") %>%
-  as.matrix()
-
-colnames(mat_prot_quant) <- str_remove(
-  colnames(mat_prot_quant), 
-  "_prot"
-)
-
-# get protein annotation
-prot_quant_annot <- tibble(
-  protein = rownames(mat_prot_quant)
-) %>%
-  left_join(., prot2gene, 
-            by = "protein") 
-
-# prepare summarized experiment object for protein-level quant
-data_prot_quant_se <- SummarizedExperiment(
-  assays = list(counts = mat_prot_quant),
-  colData = design_common,
-  rowData = prot_quant_annot
-)
-```
-
-# Principal Component Analysis of Protein-Normalized Data
-
-```{r pca_protein_norm_condition}
-#| fig-width: !expr plot_width * side_by_side_scale
-#| fig-height: !expr plot_height
-#| cache: true
-
-# Optional subsetting for PCA on protein-normalized (+ lost)
-se_protnorm_for_pca <- if (isTRUE(pca_use_interest_only)) {
-
-  keep <- rowData(se_pept_protnorm_with_lost)$is_in_scope_for_interest
-  keep[is.na(keep)] <- FALSE
-  se_pept_protnorm_with_lost[keep, , drop = FALSE]
-
-} else {
-
-  se_pept_protnorm_with_lost
-
-}
-
-pca_protnorm_with_lost <- perform_pca_analysis(
-  se_protnorm_for_pca,
-  title_suffix = "- Protein-normalized (+ lost)",
-  subtitle = if (isTRUE(pca_use_interest_only)) "Visualizing conditions - interesting features" else "Visualizing conditions - all features",
-  color_var = "condition"
-)
-
-# Reuse previously computed PCA for non-protein-normalized data
-se_nonprot_for_pca <- if (isTRUE(pca_use_interest_only)) {
-  keep <- rowData(se_pept_non_protnorm)$is_in_scope_for_interest
-  keep[is.na(keep)] <- FALSE
-  se_pept_non_protnorm[keep, , drop = FALSE]
-} else {
-  se_pept_non_protnorm
-}
-
-pca_non_protnorm <- perform_pca_analysis(
-  se_nonprot_for_pca, 
-  title_suffix = "- Non-protein-normalized",
-  subtitle = if (isTRUE(pca_use_interest_only)) "Visualizing conditions - interesting features" else "Visualizing conditions - all features",
-  color_var = "condition"
-)
-
-ggpubr::ggarrange(
-  pca_protnorm_with_lost$plot,
-  pca_non_protnorm$plot,
-  ncol = 2,
-  labels = c("A", "B")
-)
-```
-
-```{r pca_protein_norm_intersest}
-#| fig-width: !expr plot_width * side_by_side_scale
-#| fig-height: !expr plot_height
-#| cache: true
-
-# Side-by-side PCA: all features vs only interesting features (protein-normalized + lost)
-se_all <- se_pept_protnorm_with_lost
-
-# "Interesting" uses the precomputed is_in_scope_for_interest flag
-rd <- as.data.frame(rowData(se_all))
-
-keep_int <- rd$is_in_scope_for_interest
-
-keep_int[is.na(keep_int)] <- FALSE
-
-n_int <- sum(keep_int)
-
-if (n_int < 3) {
-  message("Not enough interesting features for PCA (n = ", n_int, "). Showing only 'all features'.")
-}
-
-# Build SE for interesting features if enough rows
-se_int <- if (n_int >= 3) se_all[keep_int, , drop = FALSE] else NULL
-
-# Condition-colored PCAs
-p_all_cond <- perform_pca_analysis(
-  se_all,
-  title_suffix = "- Protein-normalized (+lost)\nAll features",
-  subtitle = "Color: condition",
-  color_var = "condition"
-)$plot
-
-p_int_cond <- if (!is.null(se_int)) {
-  perform_pca_analysis(
-    se_int,
-    title_suffix = "- Protein-normalized (+lost)\nInteresting features",
-    subtitle = "Color: condition",
-    color_var = "condition"
-  )$plot
-} else NULL
-
-# Arrange side-by-side: All vs Interesting
-plots_cond <- list(p_all_cond, p_int_cond)
-
-plots_cond <- plots_cond[!vapply(plots_cond, is.null, logical(1))]
-
-if (length(plots_cond) > 0) {
-  print(ggpubr::ggarrange(plotlist = plots_cond, ncol = length(plots_cond), labels = c("A", "B")[seq_along(plots_cond)]))
-}
-```
-
-# Save Results for Downstream Analysis
-
-```{r save_results}
-#| cache: true
-
-# Save key objects for downstream analysis
-save_objects <- list(
-  annotated_df_quant = annotated_df_quant,
-  # Keep the batch-corrected raw peptide SE for reference
-  se_pept_imp_raw = se_pept_imp_corrected,
-  # New objects for protein normalization auditing
-  se_pept_protnorm_pure = se_pept_protnorm_pure,
-  se_pept_protnorm_with_lost = se_pept_protnorm_with_lost,
-  se_pept_non_protnorm = se_pept_non_protnorm,
-  # summarized protein abundance
-  se_prot_norm = data_prot_quant_se,
-  lost_features = lost_features,
-  experimental_design = experimental_design,
-  prot2gene = prot2gene,
-  parameters = list(
-    search_engine = search_engine,
-    sense_protease = sense_protease,
-    specificity_protease = specificity_protease,
-    organism_annotation = organism_annotation,
-    missing_accepted = missing_accepted,
-    pre_fix = pre_fix,
-    interesting_specificity = interesting_specificity,
-    interesting_nterm_modif = interesting_nterm_modif
-  )
-)
-
-write_rds(save_objects, file.path(rds_dir, paste0(pre_fix, "_exploratory_results.rds")))
-
-message("Exploratory analysis complete. Results saved for downstream analysis.")
-```
-
-# Session Information
-
-```{r session_info}
-sessionInfo()
 ```
