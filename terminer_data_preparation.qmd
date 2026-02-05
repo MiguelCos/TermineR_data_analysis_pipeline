@@ -257,7 +257,7 @@ if (file.exists(rds_path_prot2gene)) {
 ```
 
 ```{r annotate_peptides}
-#| cache: true
+#| cache: false
 # Annotate neo-termini
 rds_path_annotated <- file.path(rds_dir, "pre_search_annotated_data.rds")
 
@@ -460,7 +460,7 @@ annotated_df_quant <- annotated_df_quant %>%
 ```{r identification_stats}
 #| fig-width: !expr plot_width
 #| fig-height: !expr plot_height
-#| cache: true
+#| cache: false
 
 # Calculate identification statistics
 create_identification_plots <- function(data, experimental_design) {
@@ -503,7 +503,7 @@ annotated_df_quant$nterm_modif %>% table()
 ```{r median_ids_processing_type}
 #| fig-width: !expr plot_width
 #| fig-height: !expr plot_height
-#| cache: true
+#| cache: false
 
 # Calculate identifications by specificity and refined processing type (excluding specific peptides)
 ids_by_specificity_refined <- annotated_df_quant %>%

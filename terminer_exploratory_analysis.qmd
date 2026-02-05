@@ -142,7 +142,7 @@ imputation_tsv_max_mb <- 50
 # Data Loading and Annotation
 
 ```{r load_data}
-#| cache: true
+#| cache: false
 # Load data based on search engine
 rds_path_data <- file.path(rds_dir, paste0(pre_fix, search_engine, "_data.rds"))
 
@@ -266,7 +266,7 @@ if (file.exists(rds_path_prot2gene)) {
 ```
 
 ```{r annotate_peptides}
-#| cache: true
+#| cache: false
 # Annotate neo-termini
 rds_path_annotated <- file.path(rds_dir, paste0(pre_fix, "_annotated_data.rds"))
 
@@ -469,7 +469,7 @@ annotated_df_quant <- annotated_df_quant %>%
 ```{r identification_stats}
 #| fig-width: !expr plot_width
 #| fig-height: !expr plot_height
-#| cache: true
+#| cache: false
 
 # Calculate identification statistics
 create_identification_plots <- function(data, experimental_design) {
@@ -512,7 +512,7 @@ annotated_df_quant$nterm_modif %>% table()
 ```{r median_ids_processing_type}
 #| fig-width: !expr plot_width
 #| fig-height: !expr plot_height
-#| cache: true
+#| cache: false
 
 # Calculate identifications by specificity and refined processing type (excluding specific peptides)
 ids_by_specificity_refined <- annotated_df_quant %>%
@@ -584,7 +584,7 @@ Performed the search only N-term semispecific to make it faster and because of o
 ```{r median_ids_processing_type_nterm_modif}
 #| fig-width: !expr plot_width
 #| fig-height: !expr plot_height
-#| cache: true
+#| cache: false
 
 # Calculate identifications by specificity and refined processing type (excluding specific peptides)
 ids_by_specificity_refined <- annotated_df_quant %>%
@@ -653,7 +653,7 @@ knitr::kable(median_ids_refined_processing,
 ```{r missing_values}
 #| fig-width: !expr plot_width
 #| fig-height: !expr plot_height
-#| cache: true
+#| cache: false
 
 # Analyze missing value patterns
 missing_analysis <- annotated_df_quant %>%
@@ -683,7 +683,7 @@ print(missing_plot)
 # Imputation and Data Preparation
 
 ```{r imputation}
-#| cache: true
+#| cache: false
 #| fig-width: !expr plot_width
 #| fig-height: !expr plot_height 
 
@@ -1029,7 +1029,7 @@ print(pca_results_batch$plot)
 # Batch effect correction with ComBat 
 
 ```{r}
-#| cache: true
+#| cache: false
 
 # Perform batch effect correction using ComBat only if requested by the user
 if (isTRUE(do_batch_correction)) {
@@ -1065,7 +1065,7 @@ if (isTRUE(do_batch_correction)) {
 ```{r pca_after_correction}
 #| fig-width: !expr plot_width
 #| fig-height: !expr plot_height
-#| cache: true
+#| cache: false
 
 if (isTRUE(do_batch_correction)) {
 
@@ -1095,7 +1095,7 @@ if (isTRUE(do_batch_correction)) {
 ```{r batch_effect_correction}
 #| fig-width: !expr plot_width
 #| fig-height: !expr plot_height
-#| cache: true
+#| cache: false
 
 if (isTRUE(do_batch_correction)) {
   # Optional subsetting for PCA on corrected data (batch)
@@ -1124,7 +1124,7 @@ if (isTRUE(do_batch_correction)) {
 # Protein-level normalization and SE creation
 
 ```{r protein_level_normalization}
-#| cache: true
+#| cache: false
 # Build protein-normalized peptide abundances and paired SummarizedExperiment objects
 # This enables auditing of peptides excluded by protein-level normalization.
 
@@ -1341,7 +1341,7 @@ data_prot_quant_se <- SummarizedExperiment(
 ```{r pca_protein_norm_condition}
 #| fig-width: !expr plot_width * side_by_side_scale
 #| fig-height: !expr plot_height
-#| cache: true
+#| cache: false
 
 # Optional subsetting for PCA on protein-normalized (+ lost)
 se_protnorm_for_pca <- if (isTRUE(pca_use_interest_only)) {
@@ -1390,7 +1390,7 @@ ggpubr::ggarrange(
 ```{r pca_protein_norm_intersest}
 #| fig-width: !expr plot_width * side_by_side_scale
 #| fig-height: !expr plot_height
-#| cache: true
+#| cache: false
 
 # Side-by-side PCA: all features vs only interesting features (protein-normalized + lost)
 se_all <- se_pept_protnorm_with_lost
@@ -1441,7 +1441,7 @@ if (length(plots_cond) > 0) {
 # Save Results for Downstream Analysis
 
 ```{r save_results}
-#| cache: true
+#| cache: false
 
 # Save key objects for downstream analysis
 save_objects <- list(
