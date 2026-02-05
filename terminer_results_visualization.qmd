@@ -59,7 +59,7 @@ pval_threshold <- 0.05
 pre_fix <- "xx000_projectname_analysis_type"
 
 # EXPERIMENT-SPECIFIC: set protein annotation path (Uniprot TSV table of the proteome used for the search).
-protein_annotation_path <- "Z:/0_people/mcosenza/fastas_and_organims_annotations/org_annotations/human/uniprotkb_proteome_UP000005640_AND_mode_2025_08_13.tsv"
+protein_annotation_path <- "Z:/xxxx/xxxx/xxxx/.../uniprotkb_proteome_UP000005640_AND_mode_2025_08_13.tsv"
 
 # EXPERIMENT-SPECIFIC: select normalization dataset(s) of interest.
 # Options available in this notebook environment: "protnorm_pure", "protnorm_with_lost", "non_protnorm", "protein_abund_norm" refers to protein-level analysis
@@ -995,6 +995,7 @@ cleavage_sequences_by_contrast <- purrr::map(
 ```{r cleavage_heatmaps}
 #| fig-width: 6
 #| fig-height: 4
+#| cache: false
 
 # Helper to plot heatmaps for a given sequence list
 plot_cleavage_heatmaps <- function(seq_list, contrast_name, modif_name, p_number = 10) {
@@ -1015,37 +1016,51 @@ plot_cleavage_heatmaps <- function(seq_list, contrast_name, modif_name, p_number
   op <- par(mfrow = c(2, 2))
   on.exit(par(op), add = TRUE)
 
+  plotted_any <- FALSE
+
   if (!is.null(counts$c_int)) {
-    pheatmap(
+    p <- pheatmap(
       counts$c_int,
       cluster_rows = FALSE, cluster_cols = FALSE,
       main = sprintf("%s | %s\nIntracellular C-terminal (n=%s)", contrast_name, modif_name, length(seq_list$c_term_int)),
       color = colorRampPalette(brewer.pal(n = 9, name = "Reds"))(100)
     )
+    print(p)
+    plotted_any <- TRUE
   }
   if (!is.null(counts$c_ext)) {
-    pheatmap(
+    p <- pheatmap(
       counts$c_ext,
       cluster_rows = FALSE, cluster_cols = FALSE,
       main = sprintf("%s | %s\nExtracellular C-terminal (n=%s)", contrast_name, modif_name, length(seq_list$c_term_ext)),
       color = colorRampPalette(brewer.pal(n = 9, name = "Blues"))(100)
     )
+    print(p)
+    plotted_any <- TRUE
   }
   if (!is.null(counts$n_int)) {
-    pheatmap(
+    p <- pheatmap(
       counts$n_int,
       cluster_rows = FALSE, cluster_cols = FALSE,
       main = sprintf("%s | %s\nIntracellular N-terminal (n=%s)", contrast_name, modif_name, length(seq_list$n_term_int)),
       color = colorRampPalette(brewer.pal(n = 9, name = "Greens"))(100)
     )
+    print(p)
+    plotted_any <- TRUE
   }
   if (!is.null(counts$n_ext)) {
-    pheatmap(
+    p <- pheatmap(
       counts$n_ext,
       cluster_rows = FALSE, cluster_cols = FALSE,
       main = sprintf("%s | %s\nExtracellular N-terminal (n=%s)", contrast_name, modif_name, length(seq_list$n_term_ext)),
       color = colorRampPalette(brewer.pal(n = 9, name = "Purples"))(100)
     )
+    print(p)
+    plotted_any <- TRUE
+  }
+
+  if (!plotted_any) {
+    message("No cleavage heatmaps to plot for ", contrast_name, " | ", modif_name)
   }
 }
 
