@@ -6,18 +6,20 @@ This repository contains a streamlined workflow for the analysis of shotgun prot
 
 The pipeline consists of three main analysis scripts that support multiple search engine outputs:
 
-1. **Exploratory Analysis**: Data loading, quality control, and initial visualization
-2. **Inferential Analysis**: Statistical analysis, protein normalization, and GO enrichment  
-3. **Results Visualization**: Generation of publication-ready plots and summary statistics
 
-## Supported Search Engines
+1. **Data preparation**: Data loading and preparation, including missing value inputation if necessary.
+1. **Exploratory Analysis**: Data loading, quality control, and initial visualization.
+2. **Inferential Analysis**: Statistical analysis, protein normalization, and GO enrichment.  
+3. **Results Visualization**: Generation of publication-ready plots and summary statistics.
+
+## Supported search engines
 
 The pipeline supports the following search engine outputs through integrated TermineR adapters:
 
 ### 1. DIA-NN (Data-Independent Acquisition)
 - **File types**: `report.parquet` or `report.tsv`
 - **Quantification**: Precursor-level quantification with MAD scaling
-- **Modifications**: Automatic N-terminal modification detection
+- **Modifications**: Automatic N-terminal modification detection if annotated in unimod.
 
 ### 2. FragPipe TMT (Tandem Mass Tags)
 - **File types**: `psm.tsv` files in mixture directories
@@ -27,12 +29,12 @@ The pipeline supports the following search engine outputs through integrated Ter
 ### 3. FragPipe Label-Free
 - **File types**: `psm.tsv` files with intensity-based quantification
 - **Quantification**: Precursor intensity with MAD scaling
-- **Modifications**: N-terminal modification detection
+- **Modifications**: Acetyl, Dimethyl, TMT, 2PCA, Pyro-Glu
 
 ### 4. FragPipe Heavy-Light (SILAC/Dimethyl)
 - **File types**: `combined_modified_peptide_label_quant.tsv`
 - **Quantification**: Heavy/Light label quantification
-- **Modifications**: Dimethyl and Acetyl detection
+- **Modifications**: Dimethyl, Acetyl, Pyro-Glu
 
 ### 5. Spectronaut
 - **File types**: Spectronaut report TSV files
@@ -41,7 +43,7 @@ The pipeline supports the following search engine outputs through integrated Ter
 
 ## Requirements
 
-### R Packages
+### R packages
 
 The following R packages are required:
 
@@ -68,9 +70,9 @@ The following R packages are required:
 - `TermineR`: `devtools::install_github("MiguelCos/TermineR")`
 - `diann`: `devtools::install_github("vdemichev/diann-rpackage")`
 
-## Input Data Requirements
+## Input data requirements
 
-### 1. DIA-NN Report File
+### 1. DIA-NN report file
 - **Location**: `data/report.parquet` or `data/report.tsv`
 - **Description**: Output from FragPipe-DIA + DIANN quantitation
 - **Format**: Parquet or TSV file containing peptide identifications and quantitative data
@@ -78,12 +80,12 @@ The following R packages are required:
   - `.parquet` files: Uses optimized parquet adapter with MAD scaling
   - `.tsv` files: Uses standard DIA-NN adapter
 
-### 2. Experimental Annotation File
+### 2. Experimental annotation file
 - **Location**: `data/experimental_annotation.txt`
 - **Description**: Tab-delimited file describing the experimental design and sample metadata
 - **Format**: Tab-separated values (.txt or .tsv)
 
-#### Required Columns
+#### Required columns
 - **`sample`**: Sample identifier that must exactly match the column names in your search engine output files
 - **`sample_name`**: Human-readable sample name or identifier  
 - **`condition`**: Experimental condition or treatment group (e.g., "Control", "Treatment", "TU", "NAT", "PC")
@@ -92,7 +94,7 @@ The following R packages are required:
   - Use different `bio_replicate` numbers for independent biological samples
 - Additional metadata columns can be included as needed
 
-#### Annotation File Guidelines
+#### Annotation file guidelines
 1. **Header required**: First row must contain column names
 2. **Tab-delimited**: Use tab characters to separate columns
 3. **No missing values**: All required columns must have values for each sample
@@ -102,10 +104,11 @@ The following R packages are required:
    - Different `bio_replicate` = independent biological samples
    - This is critical for proper statistical modeling in limma
 
-#### Example Annotation Files
+#### Example annotation files
 See `example_annotation.txt` in the repository `data/` for a template with the minimal required columns.
 
 **Basic example:**
+
 ```
 sample	sample_name	condition	bio_replicate
 TF658	T_001	TU	1
@@ -127,27 +130,27 @@ EX005	Treatment_2	Treatment	2	A	24h
 EX006	Treatment_3	Treatment	3	B	24h
 ```
 
-### 3. Protein FASTA File
+### 3. Protein FASTA file
 - **Location**: `data/proteome.fasta`
 - **Description**: Protein sequence database used for the search
 - **Format**: Standard FASTA format
 
-### 4. TargetP Results (Optional)
+### 4. TargetP results (optional)
 - **Location**: `data/targetp_results.targetp2`
 - **Description**: TargetP2 prediction results for subcellular localization
 - **Format**: TargetP2 output format
 - **Note**: Set `targetp_location <- NULL` if not available
 
-## Configuration Parameters
+## Configuration parameters
 
-### Search Engine Selection
+### Search engine selection
 ```r
 search_engine <- "diann"  # Options: "diann", "fragpipe_tmt", "fragpipe_lf", "fragpipe_heavy_light", "spectronaut"
 ```
 
-### Data Locations (Configure based on search engine)
+### Data locations (configure based on search engine)
 
-#### DIA-NN Configuration
+#### DIA-NN configuration
 ```r
 search_engine <- "diann"
 diann_report_location <- here("initial_data/report.parquet")  # or .tsv
@@ -155,7 +158,7 @@ proteotypic_only <- TRUE
 summarization_method <- "SUM"  # or "MAX"
 ```
 
-#### FragPipe TMT Configuration
+#### FragPipe TMT configuration
 ```r
 search_engine <- "fragpipe_tmt"
 fragpipe_parent_dir <- here("initial_data/fragpipe_search")  # Directory with mix_1, mix_2, etc.
@@ -164,28 +167,28 @@ min_purity <- 0.5
 tmt_delta <- "229"  # "229" for TMT10/11, "304" for TMT16
 ```
 
-#### FragPipe Label-Free Configuration
+#### FragPipe label-free configuration
 ```r
 search_engine <- "fragpipe_lf"
 fragpipe_lf_parent_dir <- here("initial_data/fragpipe_lf_search")
 fragpipe_lf_annotation <- here("initial_data/fragpipe_lf_annotation.txt")
 ```
 
-#### FragPipe Heavy-Light Configuration
+#### FragPipe heavy-light configuration
 ```r
 search_engine <- "fragpipe_heavy_light"
 fragpipe_hl_file <- here("initial_data/combined_modified_peptide_label_quant.tsv")
 fragpipe_hl_annotation <- here("initial_data/fragpipe_hl_annotation.txt")
 ```
 
-#### Spectronaut Configuration
+#### Spectronaut configuration
 ```r
 search_engine <- "spectronaut"
 spectronaut_report <- here("initial_data/spectronaut_report.tsv")
 proteotypic_only <- TRUE
 ```
 
-### Experimental Parameters
+### Experimental parameters
 ```r
 sense_protease <- "C"  # "C" for C-terminal cleavage (trypsin), "N" for N-terminal
 specificity_protease <- "K|R"  # Protease specificity (trypsin: "K|R")
@@ -195,7 +198,7 @@ instrument <- "EX"  # Instrument prefix in sample names
 
 **Available organisms**: `"human"`, `"mouse"`, `"arabidopsis"`, `"medicago_truncatula"`, `"rhizobium_meliloti"`, `"pig"`, `"human_iso"`, `"ecoli"`
 
-### Analysis Parameters
+### Analysis parameters
 ```r
 missing_accepted <- 2 / 4  # Maximum missing values per condition (2 out of 4 replicates)
 fc_threshold <- 2.5  # Fold-change threshold for significance
@@ -203,7 +206,7 @@ pval_threshold <- 0.05  # P-value threshold for significance
 pre_fix <- "terminer_analysis_"  # Prefix for output files
 ```
 
-### Contrast Definition
+### Contrast definition
 ```r
 defined_contrasts <- c(
   "Treatment_vs_Control" = "Treatment - Control",
@@ -212,9 +215,9 @@ defined_contrasts <- c(
 )
 ```
 
-## Running the Analysis
+## Running the analysis
 
-### 1. Setup Project Structure
+### 1. Setup project structure
 Create the following directory structure:
 ```
 project_root/
@@ -236,7 +239,17 @@ project_root/
 
 **Note**: Use `example_annotation.txt` as a template for creating your `data/experimental_annotation.txt` file.
 
-### 2. Exploratory Analysis
+### 2. Data preparation step
+
+1. Open `terminer_data_preparation.qmd`.
+2. Update the parameter section with your specific settings.
+3. Execute the script to perform
+   - Data loading and formating.
+   - Missing value analysis.
+   - Missing value imputation if necessary.
+   - Store intermediary results for further analysis.
+
+### 2. Exploratory analysis
 1. Open `terminer_exploratory_analysis.qmd`
 2. Update the parameter section with your specific settings
 3. Execute the script to perform:
@@ -247,7 +260,7 @@ project_root/
    - Principal component analysis
    - Results caching for downstream analysis
 
-### 3. Inferential Analysis
+### 3. Inferential analysis
 1. Open `terminer_inferential_analysis.qmd`
 2. Define your experimental contrasts
 3. Execute the script to perform:
@@ -256,7 +269,7 @@ project_root/
    - GO enrichment analysis
    - Statistical results generation
 
-### 4. Results Visualization
+### 4. Results visualization
 1. Open `terminer_results_visualization.qmd`
 2. Execute the script to generate:
    - Volcano plots
@@ -264,37 +277,37 @@ project_root/
    - Summary statistics
    - Publication-ready figures
 
-## Output Files
+## Output files
 
-### Results Directory (`results/`)
+### Results directory (`results/`)
 - `*_differential_analysis_results.tsv`: Complete differential analysis results
 - `*_go_enrichment_results.tsv`: GO enrichment analysis results
 - `*_summary_statistics.tsv`: Summary of analysis results
 
-### RDS Cache Directory (`rds/`)
+### RDS cache directory (`rds/`)
 - Intermediate results cached for faster re-analysis
 - Can be safely deleted to force re-computation
 
-## Key Features
+## Key features
 
-### Computational Efficiency
+### Computational efficiency
 - **RDS Caching**: Computationally intensive steps are cached as RDS files
 - **Modular Design**: Each analysis step can be run independently
 - **Memory Management**: Automatic cleanup of large intermediate objects
 
-### Standardized Analysis
+### Standardized analysis
 - **Consistent Chunk Naming**: All code chunks follow standardized naming conventions
 - **Plot Sizing**: Standardized plot dimensions and DPI settings
 - **Parameter Configuration**: Centralized parameter definition
 
-### Quality Control
+### Quality control
 - **Missing Value Analysis**: Comprehensive assessment of data completeness
 - **PCA Analysis**: Quality control through principal component analysis
 - **Summary Statistics**: Detailed reporting of analysis results
 
-## Data Loading Features
+## Data loading features
 
-### Automatic File Format Detection
+### Automatic file format detection
 The pipeline automatically detects whether your DIA-NN report is in `.parquet` or `.tsv` format:
 
 - **Parquet files**: Uses the optimized `diann_adapter_parquet()` function with:
@@ -305,7 +318,7 @@ The pipeline automatically detects whether your DIA-NN report is in `.parquet` o
 
 - **TSV files**: Uses the standard `diann_adapter()` function from the diann R package
 
-### Configuration for Parquet Files
+### Configuration for parquet files
 When using parquet files, you can configure:
 ```r
 # In the data loading section
@@ -318,20 +331,22 @@ df_from_diann <- diann_adapter_parquet(
 
 ## Customization
 
-### Adding New Organisms
+### Adding new organisms
 To add support for a new organism:
 1. Ensure the organism is supported by TermineR
 2. Install the appropriate Bioconductor annotation package
 3. Update the `organism_annotation` parameter
 4. Modify the `library()` call for the organism database in the inferential script
 
-### Modifying Analysis Parameters
+You can always open an issue requesting your organism of interest, if you want to include the Uniprot Processing annotation in your analysis.
+
+### Modifying analysis parameters
 Key parameters can be adjusted in the parameter definition sections:
 - **Missing value tolerance**: Adjust `missing_accepted`
 - **Statistical thresholds**: Modify `fc_threshold` and `pval_threshold`
 - **Imputation strategy**: Customize imputation parameters in the exploratory script
 
-### Custom Contrasts
+### Custom contrasts
 Define custom contrasts in the `defined_contrasts` vector using limma syntax:
 ```r
 defined_contrasts <- c(
@@ -342,30 +357,30 @@ defined_contrasts <- c(
 
 ## Troubleshooting
 
-### Common Issues
+### Common issues
 1. **Memory errors**: Increase memory limits or process data in smaller chunks
 2. **Missing annotation**: Ensure all required input files are present and properly formatted
 3. **Contrast errors**: Verify that condition names in contrasts match those in the annotation file
 
-### Troubleshooting by Search Engine
+### Troubleshooting by search engine
 
-#### DIA-NN Issues
+#### DIA-NN issues
 - **Column naming**: Check that sample names match experimental annotation
 - **Memory issues**: Make sure you have enough memory allocated for large datasets
 
-#### FragPipe TMT Issues
+#### FragPipe TMT issues
 - **Missing annotation files**: Ensure each mixture directory has annotation.txt
 - **Reference channel**: Verify reference channel name matches annotation
 - **TMT delta**: Use correct mass delta for your TMT kit
 
-#### FragPipe Label-Free Issues
+#### FragPipe label-free issues
 - **Run mapping**: Ensure run names in annotation match spectrum file names
 
-#### FragPipe Heavy-Light Issues
+#### FragPipe heavy-light issues
 - **File format**: Ensure combined_modified_peptide_label_quant.tsv exists
 - **Label detection**: Verify heavy/light modifications are correctly detected
 
-### Getting Help
+### Getting help
 - Check the TermineR documentation: [GitHub repository](https://github.com/MiguelCos/TermineR)
 - Ensure all required packages are installed and up to date
 - Verify input file formats match the specifications above
@@ -375,6 +390,7 @@ defined_contrasts <- c(
 ## Citation
 
 If you use this pipeline in your research, please cite:
-- The TermineR package and methodology
+- The TermineR paper: https://doi.org/10.1002/pmic.202300491
+- The [TermineR repo](https://github.com/MiguelCos/TermineR)
 - Relevant Bioconductor packages (limma, clusterProfiler, etc.)
 - FragPipe and DIA-NN tools
