@@ -1,6 +1,239 @@
 # Helper Functions for TermineR Analysis Pipeline
 # These functions reduce code redundancy across analysis scripts
 
+is_pipeline_absolute_path <- function(path_value) {
+  is.character(path_value) &&
+    length(path_value) == 1 &&
+    !is.na(path_value) &&
+    grepl("^(?:[A-Za-z]:[/\\\\]|[/\\\\]{2}|~[/\\\\])", path_value)
+}
+
+resolve_pipeline_path <- function(path_value) {
+  if (is.null(path_value) || !is.character(path_value) || length(path_value) != 1 || is.na(path_value) || path_value == "") {
+    return(path_value)
+  }
+
+  if (is_pipeline_absolute_path(path_value)) {
+    return(path_value)
+  }
+
+  here::here(path_value)
+}
+
+resolve_pipeline_config_paths <- function(config) {
+  path_keys <- c(
+    "diann_report_location",
+    "fragpipe_parent_dir",
+    "fragpipe_lf_parent_dir",
+    "fragpipe_lf_annotation",
+    "fragpipe_hl_file",
+    "fragpipe_hl_annotation",
+    "spectronaut_report",
+    "location_annotation",
+    "fasta_location",
+    "uniprot_annotation",
+    "protein_annotation_path",
+    "rds_dir",
+    "results_dir"
+  )
+
+  for (key in intersect(names(config), path_keys)) {
+    config[[key]] <- resolve_pipeline_path(config[[key]])
+  }
+
+  config
+}
+
+simplify_pipeline_config <- function(x) {
+  if (!is.list(x)) {
+    return(x)
+  }
+
+  if (length(x) == 0) {
+    return(x)
+  }
+
+  simplified <- lapply(x, simplify_pipeline_config)
+
+  if (all(vapply(simplified, function(item) !is.list(item) && length(item) == 1, logical(1)))) {
+    return(unlist(simplified, recursive = FALSE, use.names = TRUE))
+  }
+
+  simplified
+}
+
+load_pipeline_config <- function(stage, config_path = here::here("config.yaml")) {
+  if (!requireNamespace("yaml", quietly = TRUE)) {
+    stop("Package 'yaml' is required to read config.yaml. Install it with install.packages('yaml').")
+  }
+
+  if (!file.exists(config_path)) {
+    stop("Config file not found: ", config_path)
+  }
+
+  raw_config <- yaml::read_yaml(config_path)
+  common_config <- raw_config$common %||% list()
+  stage_configs <- raw_config$stages %||% list()
+
+  if (!stage %in% names(stage_configs)) {
+    stop(
+      "Unknown pipeline stage: ", stage,
+      ". Expected one of: ", paste(names(stage_configs), collapse = ", ")
+    )
+  }
+
+  stage_config <- stage_configs[[stage]] %||% list()
+  merged_config <- utils::modifyList(common_config, stage_config, keep.null = TRUE)
+  merged_config <- simplify_pipeline_config(merged_config)
+  merged_config <- resolve_pipeline_config_paths(merged_config)
+  merged_config$stage <- stage
+
+  merged_config
+}
+
+load_stage_parameters <- function(stage, config_path = here::here("config.yaml"), envir = parent.frame()) {
+  config <- load_pipeline_config(stage = stage, config_path = config_path)
+  list2env(config, envir = envir)
+  invisible(config)
+}
+
+default_pipeline_config_path <- function() {
+  candidate_paths <- c(
+    here::here("r_project_files", "config.yaml"),
+    here::here("config.yaml")
+  )
+
+  existing_path <- candidate_paths[file.exists(candidate_paths)][1]
+
+  if (is.na(existing_path)) {
+    stop(
+      "Config file not found. Expected one of: ",
+      paste(candidate_paths, collapse = ", ")
+    )
+  }
+
+  existing_path
+}
+
+normalize_pipeline_experimental_design <- function(experimental_design) {
+  if (!is.data.frame(experimental_design)) {
+    stop("experimental_design must be a data.frame")
+  }
+
+  if ("replicate" %in% names(experimental_design) && !"bio_replicate" %in% names(experimental_design)) {
+    experimental_design$bio_replicate <- experimental_design$replicate
+  }
+
+  if ("bio_replicate" %in% names(experimental_design) && !"replicate" %in% names(experimental_design)) {
+    experimental_design$replicate <- experimental_design$bio_replicate
+  }
+
+  if ("replicate" %in% names(experimental_design)) {
+    experimental_design$replicate <- as.character(experimental_design$replicate)
+  }
+
+  if ("bio_replicate" %in% names(experimental_design)) {
+    experimental_design$bio_replicate <- as.character(experimental_design$bio_replicate)
+  }
+
+  if ("measurement_batch" %in% names(experimental_design)) {
+    experimental_design$measurement_batch <- as.factor(experimental_design$measurement_batch)
+  }
+
+  if ("plex" %in% names(experimental_design)) {
+    experimental_design$plex <- as.factor(experimental_design$plex)
+  }
+
+  if ("measurement_batch" %in% names(experimental_design) && !"plex" %in% names(experimental_design)) {
+    experimental_design$plex <- experimental_design$measurement_batch
+  }
+
+  if ("plex" %in% names(experimental_design) && !"measurement_batch" %in% names(experimental_design)) {
+    experimental_design$measurement_batch <- experimental_design$plex
+  }
+
+  experimental_design
+}
+
+load_pipeline_experimental_design <- function(location_annotation, search_data_colnames, instrument) {
+  experimental_design <- readr::read_delim(location_annotation, show_col_types = FALSE)
+  experimental_design <- dplyr::filter(
+    experimental_design,
+    sample %in% stringr::str_subset(search_data_colnames, paste0("^", instrument))
+  )
+
+  normalize_pipeline_experimental_design(experimental_design)
+}
+
+filter_pipeline_experimental_design <- function(experimental_design,
+                                                observed_samples,
+                                                replicate_column = "replicate") {
+  experimental_design <- normalize_pipeline_experimental_design(experimental_design)
+  experimental_design <- dplyr::filter(experimental_design, sample %in% observed_samples)
+
+  if (!replicate_column %in% names(experimental_design)) {
+    return(experimental_design)
+  }
+
+  replicate_values <- experimental_design[[replicate_column]]
+  replicate_values <- replicate_values[!is.na(replicate_values) & replicate_values != ""]
+
+  if (!any(duplicated(replicate_values))) {
+    message(
+      "No repeated groups detected in '", replicate_column,
+      "'. Skipping replicate-group filtering."
+    )
+    return(experimental_design)
+  }
+
+  experimental_design <- dplyr::group_by(
+    experimental_design,
+    dplyr::across(dplyr::all_of(replicate_column))
+  )
+  experimental_design <- dplyr::filter(experimental_design, dplyr::n() >= 2)
+  dplyr::ungroup(experimental_design)
+}
+
+resolve_limma_blocking_values <- function(experimental_design,
+                                          blocking_column = "replicate",
+                                          dataset_name = NULL) {
+  experimental_design <- normalize_pipeline_experimental_design(experimental_design)
+
+  if (!blocking_column %in% names(experimental_design)) {
+    stop(
+      "Blocking is enabled but column '", blocking_column,
+      "' was not found in the experimental design",
+      if (!is.null(dataset_name)) paste0(" for dataset '", dataset_name, "'"),
+      ". Available columns: ",
+      paste(names(experimental_design), collapse = ", ")
+    )
+  }
+
+  blocking_values <- experimental_design[[blocking_column]]
+
+  if (any(is.na(blocking_values) | blocking_values == "")) {
+    stop(
+      "Blocking column '", blocking_column,
+      "' contains missing or blank values",
+      if (!is.null(dataset_name)) paste0(" for dataset '", dataset_name, "'"),
+      "."
+    )
+  }
+
+  block_sizes <- table(blocking_values)
+
+  if (!any(block_sizes >= 2)) {
+    stop(
+      "Blocking is enabled but column '", blocking_column,
+      "' does not contain repeated groups",
+      if (!is.null(dataset_name)) paste0(" for dataset '", dataset_name, "'"),
+      ". Disable blocking or provide a repeated-measures column."
+    )
+  }
+
+  factor(blocking_values)
+}
+
 #' Smart data loader that handles different search engine outputs
 #' @param search_engine Type of search engine ("diann", "fragpipe_tmt", "fragpipe_lf", "fragpipe_heavy_light", "spectronaut")
 #' @param file_paths Named list of file paths for the specific search engine
@@ -285,7 +518,7 @@ create_regulation_heatmap <- function(results_data, top_n = 50, fc_threshold = 2
 #' @param min_fraction_condition Minimum fraction of non-missing values required in a condition to keep a feature (numeric 0-1)
 #' @param min_fraction_replicate Minimum fraction across replicates (currently used as a secondary filter) (numeric 0-1)
 #' @param min_n_peptides Minimum number of peptides/features required to consider (currently treated as minimum non-missing per condition)
-#' @return SummarizedExperiment (with imputed assay) with attribute 'imputation_summary' attached (data.frame)
+#' @return List with the imputed SummarizedExperiment, imputation summary table, and sparse-feature exclusion metadata
 terminer_imputation <- function(se,
                                 min_fraction_condition = 0.5,
                                 tune_sigma = 1,
@@ -304,6 +537,7 @@ terminer_imputation <- function(se,
 
   counts <- SummarizedExperiment::assay(se, "counts")
   if (is.null(counts) || !is.matrix(counts)) stop("Assay 'counts' not found or not a matrix in the provided SummarizedExperiment.")
+  n_features_input <- nrow(counts)
 
   # Prepare experimental_design from colData
   col_ann <- as.data.frame(SummarizedExperiment::colData(se))
@@ -379,7 +613,37 @@ terminer_imputation <- function(se,
   peptide_missingness <- peptide_missingness %>%
     dplyr::left_join(peptide_missingness_all, by = "nterm_modif_peptide")
 
-  sparse_features <- peptide_missingness %>% dplyr::filter(all_conditions_missing == TRUE) %>% dplyr::pull(nterm_modif_peptide) %>% unique()
+  sparse_feature_missingness <- peptide_missingness %>%
+    dplyr::filter(all_conditions_missing == TRUE)
+
+  sparse_features <- sparse_feature_missingness %>%
+    dplyr::pull(nterm_modif_peptide) %>%
+    unique()
+
+  n_sparse_features_excluded <- length(sparse_features)
+  message(
+    "Sparse-feature filter excluded ", n_sparse_features_excluded,
+    " of ", n_features_input,
+    " features that exceeded the missingness threshold in every condition."
+  )
+
+  sparse_feature_summary_table <- sparse_feature_missingness %>%
+    dplyr::group_by(nterm_modif_peptide) %>%
+    dplyr::summarise(
+      n_conditions = dplyr::n_distinct(condition),
+      min_quantified_per_condition = min(Num_Quantified_per_cond, na.rm = TRUE),
+      max_quantified_per_condition = max(Num_Quantified_per_cond, na.rm = TRUE),
+      mean_missing_fraction = mean(Proportion_Missing, na.rm = TRUE),
+      .groups = 'drop'
+    )
+
+  sparse_feature_annotations <- as.data.frame(
+    SummarizedExperiment::rowData(se)[sparse_features, , drop = FALSE]
+  )
+
+  if (nrow(sparse_feature_annotations) > 0 && !"nterm_modif_peptide" %in% names(sparse_feature_annotations)) {
+    sparse_feature_annotations$nterm_modif_peptide <- rownames(sparse_feature_annotations)
+  }
 
   # Step 3: Filter out sparse features and merge missingness info
   quant_peptide_data_long <- quant_peptide_data_long %>%
@@ -538,6 +802,11 @@ terminer_imputation <- function(se,
   # Return a list with the SummarizedExperiment and the imputation summary table
   return(list(
     se = se_imputed,
-    imputation_summary_table = imputation_summary_table
+    imputation_summary_table = imputation_summary_table,
+    n_sparse_features_excluded = n_sparse_features_excluded,
+    sparse_features = sparse_features,
+    sparse_feature_summary_table = sparse_feature_summary_table,
+    sparse_feature_missingness = sparse_feature_missingness,
+    sparse_feature_annotations = sparse_feature_annotations
   ))
 }

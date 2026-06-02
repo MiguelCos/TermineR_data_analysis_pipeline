@@ -1,30 +1,31 @@
 # Copilot Instructions for TermineR Data Analysis Pipeline
 
-## Big picture architecture
-- This repo is an R/Quarto pipeline with three staged reports: `terminer_exploratory_analysis.qmd` → `terminer_inferential_analysis.qmd` → `terminer_results_visualization.qmd`.
-- Exploratory analysis loads search-engine outputs (DIA-NN, FragPipe TMT/LF/HL, Spectronaut), annotates with TermineR, and writes cached `rds/` artifacts used by downstream scripts.
-- Inferential analysis consumes cached RDS objects for limma-based differential analysis and GO enrichment; visualization consumes those results to build publication plots.
+## Start Here
+- Use [README.md](../README.md) for dependency installation, supported search engines, and input file requirements.
+- Treat [config.yaml](../config.yaml) as the source of truth for pipeline parameters. Prefer changing config values over hardcoding notebook variables.
+- Configuration lookup is not root-only: `default_pipeline_config_path()` in [scr/helper_functions.R](../scr/helper_functions.R) checks `r_project_files/config.yaml` before the repo-root `config.yaml`.
 
-## Key files and where logic lives
-- `terminer_exploratory_analysis.qmd`: parameter block, adapter selection via `search_engine`, and initial caching (`*_data.rds`).
-- `scr/helper_functions.R`: shared helpers (`load_search_engine_data()`, PCA/volcano helpers, `safe_rds_read()` cache wrapper).
-- `scr/modif_diann_adapter.R`: DIA-NN parquet/TSV adapter logic used when `search_engine == "diann"`.
-- `terminer_inferential_analysis.qmd` and `terminer_results_visualization.qmd`: downstream stages (assume inputs from `rds/` and outputs in `results/`).
+## Pipeline Shape
+- This repo is a four-stage R/Quarto workflow and should be handled in order: `terminer_data_preparation.qmd` -> `terminer_exploratory_analysis.qmd` -> `terminer_inferential_analysis.qmd` -> `terminer_results_visualization.qmd`.
+- The notebooks are the execution surface. There is no CI, test harness, or scripted build pipeline in the repo.
+- `save_key_objects.R` is a side utility for exporting inferential objects, not a required stage.
 
-## Data flow & conventions
-- File paths are set with `here()` and assume repo-root execution; keep new paths aligned with `data/`, `rds/`, and `results/`.
-- `search_engine` drives a `switch()` in the exploratory report; keep new adapters consistent with this pattern.
-- DIA-NN: `.parquet` vs `.tsv` is auto-detected; TSV requires column renaming based on `instrument` prefix.
-- FragPipe TMT: expects `mix_*/psm.tsv` under `data/` plus an `experiment_annotation.tsv` (see `data/example_fragpipe_tmt_search/`).
-- Experimental annotation must contain `sample`, `sample_name`, `condition`, `bio_replicate`; sample IDs must match search output columns.
-- RDS caching is standard: read if present, compute + `write_rds()` otherwise; deleting `rds/` forces recomputation.
+## Where Behavior Lives
+- [scr/helper_functions.R](../scr/helper_functions.R): shared config loading, path resolution, experimental-design normalization, caching helpers, and plotting utilities.
+- [scr/modif_diann_adapter.R](../scr/modif_diann_adapter.R): DIA-NN-specific loading and column handling.
+- [terminer_data_preparation.qmd](../terminer_data_preparation.qmd): primary search-engine switch and initial cache creation.
+- Downstream notebooks mostly consume cached `.rds` objects and `results/` tables rather than reimplementing loaders.
 
-## Developer workflow (R/Quarto)
-- Run the pipeline in order: exploratory → inferential → results visualization.
-- Quarto chunks use `cache: true` and suppress messages; keep chunk names stable to preserve caching.
-- External deps include TermineR, diann, Bioconductor packages (limma, clusterProfiler, SummarizedExperiment, etc.) as listed in `README.md`.
+## Repo Conventions
+- Keep paths repo-relative through `here()` unless the config intentionally uses absolute paths.
+- `search_engine` is the main routing knob. Supported values are `diann`, `fragpipe_tmt`, `fragpipe_lf`, `fragpipe_heavy_light`, and `spectronaut`; keep adapter changes aligned with that switch-based pattern.
+- `instrument` is used as a prefix filter for quantitative sample columns. If it does not match the actual sample columns, sample selection can fail quietly.
+- Experimental annotations must align exactly with search-output sample names. The helper layer normalizes legacy `replicate` and `bio_replicate` columns, so prefer reusing that behavior instead of open-coding column fixes.
+- Cached filenames are coupled to both `pre_fix` and `search_engine`. Changing either breaks downstream cache reads until artifacts are regenerated.
+- Quarto chunk caching is enabled broadly with stable chunk names. Avoid renaming chunks unless you want to invalidate cached execution.
 
-## Project-specific patterns
-- Prefer helper functions in `scr/helper_functions.R` over duplicating adapter logic.
-- Use `safe_rds_read()` for any expensive computation to align with existing caching style.
-- Results are TSVs in `results/`; intermediate objects in `rds/`.
+## Editing Guidance
+- For new parameters, extend [config.yaml](../config.yaml) under `common` or the matching `stages.<stage>` block, then load them through `load_stage_parameters()`.
+- Prefer existing helpers over duplicate notebook logic, especially for config resolution, sample/annotation normalization, and cache access.
+- If a change affects adapter outputs or cache naming, verify both [terminer_data_preparation.qmd](../terminer_data_preparation.qmd) and [terminer_exploratory_analysis.qmd](../terminer_exploratory_analysis.qmd).
+- If notebook output looks stale, inspect `rds/` before assuming the analysis code is wrong.

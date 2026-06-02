@@ -40,31 +40,19 @@ suppressPackageStartupMessages({
 
 # Set options and directories
 options(max.print = 1000, scipen = 999, stringsAsFactors = FALSE)
-rds_dir <- here("rds")
-results_dir <- here("results")
+source(here("scr/helper_functions.R"))
+config <- load_stage_parameters(
+  stage = "inferential",
+  config_path = default_pipeline_config_path()
+)
 dir.create(results_dir, showWarnings = FALSE, recursive = TRUE)
-
-# Plot parameters
-plot_width <- 10
-plot_height <- 8
-
-# Parameters for 'interesting features'
-# EXPERIMENT-SPECIFIC: define DA scope for your study.
-# Define DA scope as: always semi-specific; if N-term patterns provided, require those too.
-interesting_specificity <- c("semi_Nterm", "semi_Cterm")  # e.g., c("semi_Nterm")
-interesting_nterm_modif <- c("n", "Acetyl")  # e.g., c("Dimethyl")
-interesting_processing_type <- c("not_canonical")
-
-# EXPERIMENT-SPECIFIC: set protein annotation path (Uniprot TSV table of the proteome used for the search).
-protein_annotation_path <- "Z:/xxxx/xxxx/xxxx/.../uniprotkb_proteome_UP000005640_AND_mode_2025_08_13.tsv"
 
 ```
 
 ```{r load_exploratory_results}
 #| cache: true
-# EXPERIMENT-SPECIFIC: ensure this matches the exploratory output prefix.
 # Load results from exploratory analysis
-exploratory_results <- read_rds(file.path(rds_dir, "pre_search_exploratory_results.rds"))
+exploratory_results <- read_rds(file.path(rds_dir, paste0(pre_fix, "_exploratory_results.rds")))
 
 # Extract objects
 annotated_df_quant <- exploratory_results$annotated_df_quant
@@ -73,6 +61,8 @@ experimental_design <- exploratory_results$experimental_design
 prot2gene <- exploratory_results$prot2gene
 params <- exploratory_results$parameters
 
+experimental_design <- normalize_pipeline_experimental_design(experimental_design)
+
 # Also extract precomputed SE objects for DA
 se_pept_protnorm_pure <- exploratory_results$se_pept_protnorm_pure
 se_pept_protnorm_with_lost <- exploratory_results$se_pept_protnorm_with_lost
@@ -80,22 +70,14 @@ se_pept_non_protnorm <- exploratory_results$se_pept_non_protnorm
 lost_features <- exploratory_results$lost_features
 se_prot_norm <- exploratory_results$se_prot_norm
 
-# EXPERIMENT-SPECIFIC: update thresholds for your study.
-# Analysis parameters
-fc_threshold <- 1.2
-pval_threshold <- 0.05
+# Keep the saved exploratory parameters available for downstream filtering.
 pre_fix <- params$pre_fix
 ```
 
 ```{r define_contrasts}
 #| cache: false
-# EXPERIMENT-SPECIFIC: define contrasts using your condition names.
-# Define contrasts for differential analysis
-defined_contrasts <- c(
-      Tumor_v_NAT = "Tumor - NAT",
-      Tumor_v_PC = "Tumor - PC",
-      PC_v_NAT = "PC - NAT"
-)
+# Contrasts are loaded from config.yaml.
+defined_contrasts <- unlist(defined_contrasts, use.names = TRUE)
 
 # Convert contrasts for limma
 contrasts_list <- lapply(names(defined_contrasts), function(name) {
@@ -121,10 +103,8 @@ protein_annotation <- read_tsv(
 
 ```{r select_datasets_for_da}
 #| cache: false
-# EXPERIMENT-SPECIFIC: choose which datasets to analyze in parallel.
-# Choose which datasets to analyze in parallel
-# Options available in this notebook environment: "protnorm_pure", "protnorm_with_lost", "non_protnorm", "protein_abund_norm" refers to protein-level analysis
-datasets_to_analyze <- c("protnorm_with_lost", "non_protnorm", "protein_abund_norm")
+# Datasets are loaded from config.yaml.
+# Options: "protnorm_pure", "protnorm_with_lost", "non_protnorm", "protein_abund_norm"
 
 # Map dataset name to SE object (skip NULLs)
 se_map <- list(
@@ -156,16 +136,16 @@ run_limma_analysis <- function(se, dataset_name, annotation_df = NULL) {
   
   # Get data matrix
   data_matrix <- assay(se)
+  design_data <- normalize_pipeline_experimental_design(as.data.frame(colData(se)))
   
   # Get conditions and check they exist
-  conditions <- colData(se)$condition
-  bio_replicates <- colData(se)$bio_replicate
+  conditions <- design_data$condition
 
   available_conditions <- unique(conditions)
   message("Available conditions: ", paste(available_conditions, collapse = ", "))
   
   # Create design matrix
-  design <- model.matrix(~ 0 + condition, data = colData(se))
+  design <- model.matrix(~ 0 + condition, data = design_data)
   colnames(design) <- str_remove(colnames(design), "^condition")
   message("Design matrix columns: ", paste(colnames(design), collapse = ", "))
   
@@ -203,18 +183,37 @@ run_limma_analysis <- function(se, dataset_name, annotation_df = NULL) {
 
   message("Contrast matrix columns: ", paste(colnames(contrast_matrix), collapse = ", "))
 
-  cor <- duplicateCorrelation(
-    data_matrix, 
-    design, 
-    block = bio_replicates)
+  if (isTRUE(use_blocking)) {
+    blocking_values <- resolve_limma_blocking_values(
+      experimental_design = design_data,
+      blocking_column = blocking_column,
+      dataset_name = dataset_name
+    )
 
-  # Fit model
-  fit <- lmFit(
-    data_matrix, 
-    design, 
-    method = "ls", 
-    block = bio_replicates, 
-    correlation = cor$consensus)
+    message("Blocking enabled using column '", blocking_column, "'. (Repeated measures experiment)")
+
+    cor <- duplicateCorrelation(
+      data_matrix,
+      design,
+      block = blocking_values
+    )
+
+    fit <- lmFit(
+      data_matrix,
+      design,
+      method = "ls",
+      block = blocking_values,
+      correlation = cor$consensus
+    )
+  } else {
+    message("Blocking disabled. Running limma without duplicateCorrelation().")
+
+    fit <- lmFit(
+      data_matrix,
+      design,
+      method = "robust"
+    )
+  }
 
   fit2 <- contrasts.fit(fit, contrast_matrix)
   fit2 <- eBayes(fit2)
@@ -330,6 +329,68 @@ if (length(limma_results_list) > 0) {
 
 # GO Enrichment Analysis (per dataset)
 
+```{r save_limma_results}
+#| cache: true
+
+# Save limma outputs before any optional GO analysis so GO can be re-run independently.
+all_results_combined <- all_results_combined %>%
+  left_join(protein_annotation, by = "protein")
+
+limma_results <- list(
+  by_dataset = limma_results_list,
+  all_results = all_results_combined
+)
+
+write_rds(limma_results, file.path(rds_dir, paste0(pre_fix, "_limma_results.rds")))
+
+# Save individual dataset results
+for (ds in names(limma_results_list)) {
+  result_table <- limma_results_list[[ds]]$results %>%
+    dplyr::select(
+      nterm_modif_peptide,
+      contrast,
+      logFC,
+      AveExpr,
+      t,
+      P.Value,
+      adj.P.Val,
+      regulation,
+      dataset,
+      everything()
+    ) %>%
+    dplyr::arrange(contrast, adj.P.Val) %>%
+    left_join(
+      prot2gene,
+      by = c("protein" = "protein")
+    )
+
+  write_tsv(
+    result_table,
+    file.path(results_dir, paste0(pre_fix, "_differential_analysis_", ds, ".tsv"))
+  )
+}
+
+write_tsv(
+  all_results_combined %>%
+    dplyr::select(
+      nterm_modif_peptide,
+      contrast,
+      logFC,
+      AveExpr,
+      t,
+      P.Value,
+      adj.P.Val,
+      regulation,
+      dataset,
+      everything()
+    ) %>%
+    dplyr::arrange(dataset, contrast, adj.P.Val),
+  file.path(results_dir, paste0(pre_fix, "_differential_analysis_combined.tsv"))
+)
+
+message("Limma results saved to: ", results_dir)
+```
+
 ```{r go_helpers}
 #| cache: false
 # Utilities for GO enrichment and plotting across BP/MF/CC with simplification
@@ -423,73 +484,120 @@ plot_go_compare <- function(go_cc, main_title = "GO") {
       axis.text.x = ggplot2::element_text(angle = 45, hjust = 1, vjust = 1, size = 8)
     )
 }
+
+  flatten_go_results <- function(go_results) {
+    purrr::imap_dfr(go_results, function(go_list, dataset_name) {
+      purrr::imap_dfr(go_list, function(go_result, ontology_name) {
+        if (is.null(go_result)) {
+          return(tibble::tibble())
+        }
+
+        go_df <- as.data.frame(go_result)
+
+        if (nrow(go_df) == 0) {
+          return(tibble::tibble())
+        }
+
+        go_df %>%
+          dplyr::mutate(
+            dataset = dataset_name,
+            ontology = ontology_name,
+            .before = 1
+          )
+      })
+    })
+  }
 ```
+
+  ```{r go_options}
+  #| cache: false
+
+  should_run_go_analysis <- exists("run_go_analysis") && isTRUE(run_go_analysis)
+  limma_results_path <- file.path(rds_dir, paste0(pre_fix, "_limma_results.rds"))
+  ```
 
 ```{r go_enrichment}
 #| cache: false
 #| fig-width: !expr plot_width
 #| fig-height: !expr plot_height
 
-# Simple GO enrichment for each dataset
+  if (!should_run_go_analysis) {
+    message("Skipping GO enrichment because stages.inferential.run_go_analysis is FALSE.")
+  } else {
+    go_results_path <- file.path(rds_dir, paste0(pre_fix, "_go_enrichment_results.rds"))
+    go_results_tsv_path <- file.path(results_dir, paste0(pre_fix, "_go_enrichment_results.tsv"))
 
-if (!file.exists(file.path(rds_dir, paste0(pre_fix, "_go_enrichment_results.rds")))) {
-  message("No pre-search GO enrichment results found. Running GO enrichment...")
+    go_limma_results <- if (exists("limma_results")) {
+      limma_results
+    } else {
+      read_rds(limma_results_path)
+    }
 
-  go_results <- list()
+    go_limma_results_list <- go_limma_results$by_dataset
 
-  for (ds in names(limma_results_list)) {
-    message("Running GO enrichment for dataset: ", ds)
+    if (!file.exists(go_results_path)) {
+      message("No pre-search GO enrichment results found. Running GO enrichment...")
 
-    # Build input expected by run_go_enrichment(): gene, regulation, contrast
-    differential_abundant_features <- limma_results_list[[ds]]$results %>%
-      dplyr::filter(!is.na(protein)) %>%
-      dplyr::mutate(
-        regulation = dplyr::case_when(
-          adj.P.Val < pval_threshold & logFC > log2(fc_threshold) ~ "upregulated",
-          adj.P.Val < pval_threshold & logFC < -log2(fc_threshold) ~ "downregulated",
-          TRUE ~ "not_significant"
+      go_results <- list()
+
+      for (ds in names(go_limma_results_list)) {
+        message("Running GO enrichment for dataset: ", ds)
+
+        differential_abundant_features <- go_limma_results_list[[ds]]$results %>%
+          dplyr::filter(!is.na(protein)) %>%
+          dplyr::mutate(
+            regulation = dplyr::case_when(
+              adj.P.Val < pval_threshold & logFC > log2(fc_threshold) ~ "upregulated",
+              adj.P.Val < pval_threshold & logFC < -log2(fc_threshold) ~ "downregulated",
+              TRUE ~ "not_significant"
+            )
+          ) %>%
+          dplyr::filter(regulation != "not_significant") %>%
+          dplyr::select(protein, regulation, contrast) %>%
+          dplyr::distinct()
+
+        if (nrow(differential_abundant_features) == 0) {
+          message("No significant features for ", ds)
+          next
+        }
+
+        universe_genes <- go_limma_results_list[[ds]]$results %>%
+          dplyr::filter(!is.na(protein)) %>%
+          dplyr::pull(protein) %>%
+          unique()
+
+        go_list <- run_go_enrichment(
+          upregulated_features = differential_abundant_features,
+          universe = universe_genes,
+          OrgDb = org.Hs.eg.db,
+          keyType = "UNIPROT",
+          ont = c("BP", "MF", "CC")
         )
-      ) %>%
-      dplyr::filter(regulation != "not_significant") %>%
-      dplyr::select(protein, regulation, contrast) %>%
-      dplyr::distinct()
 
-    if (nrow(differential_abundant_features) == 0) {
-      message("No significant features for ", ds)
-      next
+        go_results[[ds]] <- go_list
+
+        for (o in c("BP", "MF", "CC")) {
+          p <- plot_go_compare(go_list[[o]], main_title = paste0("GO ", o, " - ", ds))
+          if (!is.null(p)) print(p)
+        }
+      }
+
+      if (length(go_results) > 0) {
+        write_rds(go_results, go_results_path)
+      }
+    } else {
+      message("Loading pre-computed GO enrichment results... (corroborate these were run on the same limma results!)")
+      go_results <- read_rds(go_results_path)
     }
 
-    universe_genes <- limma_results_list[[ds]]$results %>%
-      dplyr::filter(!is.na(protein)) %>%
-      dplyr::pull(protein) %>%
-      unique()
+    go_results_table <- flatten_go_results(go_results)
 
-    # Use helper to run enrichment across BP/MF/CC
-    go_list <- run_go_enrichment(
-      upregulated_features = differential_abundant_features,
-      universe = universe_genes,
-      OrgDb = org.Hs.eg.db,
-      keyType = "UNIPROT",
-      ont = c("BP", "MF", "CC")
-    )
-
-    go_results[[ds]] <- go_list
-
-    # Plot using helper
-    for (o in c("BP", "MF", "CC")) {
-      p <- plot_go_compare(go_list[[o]], main_title = paste0("GO ", o, " - ", ds))
-      if (!is.null(p)) print(p)
+    if (nrow(go_results_table) > 0) {
+      write_tsv(go_results_table, go_results_tsv_path)
+    } else {
+      message("No GO enrichment rows to export.")
     }
   }
-
-  # Save GO results
-  if (length(go_results) > 0) {
-    write_rds(go_results, file.path(rds_dir, paste0(pre_fix, "_go_enrichment_results.rds"))
-  }
-} else {
-  message("Loading pre-computed GO enrichment results... (corroborate these were run on the same DA results!)")
-  go_results <- read_rds(file.path(rds_dir, paste0(pre_fix, "_go_enrichment_results.rds")))
-}
 ```
 
 # GroupGO CC on features from limma results
@@ -499,150 +607,110 @@ if (!file.exists(file.path(rds_dir, paste0(pre_fix, "_go_enrichment_results.rds"
 #| fig-width: !expr plot_width
 #| fig-height: !expr plot_height
 
+  if (!should_run_go_analysis) {
+    message("Skipping GroupGO mapping because stages.inferential.run_go_analysis is FALSE.")
+  } else {
+    go_groups_path <- file.path(rds_dir, paste0(pre_fix, "_go_cc_mapping.rds"))
+    go_groups_tsv_path <- file.path(results_dir, paste0(pre_fix, "_go_cc_grouping_results.tsv"))
+    go_mapping_tsv_path <- file.path(results_dir, paste0(pre_fix, "_go_cc_mapping.tsv"))
 
-if (!file.exists(file.path(rds_dir, paste0(pre_fix, "_go_cc_mapping.rds")))) {
-  message("No pre-computed GO CC mapping found. Running GroupGO...")
-
-  # Simple GroupGO for each dataset
-
-  groupgo_results <- list()
-
-  for (ds in names(limma_results_list)) {
-    message("Running GroupGO for dataset: ", ds)
-
-    # Get all genes from limma results
-    all_genes <- limma_results_list[[ds]]$results %>%
-      dplyr::filter(!is.na(protein)) %>%
-      dplyr::pull(protein) %>%
-      unique()
-
-    if (length(all_genes) == 0) {
-      message("No genes found for ", ds)
-      next
+    go_limma_results <- if (exists("limma_results")) {
+      limma_results
+    } else {
+      read_rds(limma_results_path)
     }
 
-    # Run GroupGO
-    groupgo_cc <- tryCatch({
-      clusterProfiler::groupGO(
-        gene = all_genes,
-        OrgDb = org.Hs.eg.db, # change to other organism if needed
-        keyType = "UNIPROT",
-        ont = "CC",
-        level = 3,
-        readable = TRUE
-      )
-    }, error = function(e) NULL)
+    go_limma_results_list <- go_limma_results$by_dataset
 
-    if (is.null(groupgo_cc) || nrow(as.data.frame(groupgo_cc)) == 0) {
-      message("No GroupGO results for ", ds)
-      next
+    if (!file.exists(go_groups_path)) {
+      message("No pre-computed GO CC mapping found. Running GroupGO...")
+
+      groupgo_results <- list()
+
+      for (ds in names(go_limma_results_list)) {
+        message("Running GroupGO for dataset: ", ds)
+
+        all_genes <- go_limma_results_list[[ds]]$results %>%
+          dplyr::filter(!is.na(protein)) %>%
+          dplyr::pull(protein) %>%
+          unique()
+
+        if (length(all_genes) == 0) {
+          message("No genes found for ", ds)
+          next
+        }
+
+        groupgo_cc <- tryCatch({
+          clusterProfiler::groupGO(
+            gene = all_genes,
+            OrgDb = org.Hs.eg.db,
+            keyType = "UNIPROT",
+            ont = "CC",
+            level = 3,
+            readable = TRUE
+          )
+        }, error = function(e) NULL)
+
+        if (is.null(groupgo_cc) || nrow(as.data.frame(groupgo_cc)) == 0) {
+          message("No GroupGO results for ", ds)
+          next
+        }
+
+        groupgo_results[[ds]] <- groupgo_cc
+      }
+
+      if (length(groupgo_results) > 0) {
+        write_rds(groupgo_results, go_groups_path)
+      }
+    } else {
+      message("Loading pre-computed GO CC mapping... (corroborate these were run on the same limma results!)")
+      groupgo_results <- read_rds(go_groups_path)
     }
 
-    groupgo_results[[ds]] <- groupgo_cc
-    
+    groupgo_results_table <- purrr::imap_dfr(groupgo_results, function(groupgo_result, dataset_name) {
+      if (is.null(groupgo_result)) {
+        return(tibble::tibble())
+      }
+
+      groupgo_df <- as.data.frame(groupgo_result)
+
+      if (nrow(groupgo_df) == 0) {
+        return(tibble::tibble())
+      }
+
+      groupgo_df %>%
+        dplyr::mutate(dataset = dataset_name, .before = 1)
+    })
+
+    if (nrow(groupgo_results_table) > 0) {
+      write_tsv(groupgo_results_table, go_groups_tsv_path)
+
+      go_cc_mapping <- groupgo_results_table %>%
+        distinct() %>%
+        dplyr::filter(Count >= 2) %>%
+        separate_rows(geneID, sep = "/") %>%
+        dplyr::select(gene = geneID, GO = ID, Description) %>%
+        group_by(gene) %>%
+        summarise(
+          GO = paste(unique(GO), collapse = "; "),
+          Description = paste(unique(Description), collapse = "; "),
+          n_GO_terms = n(),
+          .groups = "drop"
+        ) %>%
+        mutate(
+          extracellular_or_cytoplasm = case_when(
+            str_detect(Description, "extracellular") ~ "extracellular",
+            str_detect(Description, "cytoplasm|intracellular") ~ "cytoplasm",
+            str_detect(Description, "membrane") ~ "membrane",
+            TRUE ~ "other/various"
+          )
+        )
+
+      write_tsv(go_cc_mapping, go_mapping_tsv_path)
+    } else {
+      message("No GroupGO rows to export.")
+    }
   }
-
-  write_rds(groupgo_results, file.path(rds_dir, paste0(pre_fix, "_go_cc_mapping.rds")))
-
-} else {
-  message("Loading pre-computed GO CC mapping... (corroborate these were run on the same DA results!)")
-  groupgo_results <- read_rds(file.path(rds_dir, paste0(pre_fix, "_go_cc_mapping.rds")))
-}
-
-# Build gene to GO CC mapping table
-go_cc_mapping <- bind_rows(
-  groupgo_results$protnorm_with_lost@result,
-  groupgo_results$non_protnorm@result
-) %>% 
-  distinct() %>%
-  dplyr::filter(
-    Count >= 2
-  ) %>%
-  separate_rows(geneID, sep = "/") %>%
-  dplyr::select(gene = geneID, GO = ID, Description) %>% 
-  # collapse GO IDs and Descriptions per gene
-  group_by(gene) %>%
-  summarise(
-    GO = paste(unique(GO), collapse = "; "),
-    Description = paste(unique(Description), collapse = "; "),
-    n_GO_terms = n()
-  ) %>%
-  ungroup() %>% 
-  mutate(
-    extracellular_or_cytoplasm = case_when(
-      str_detect(Description, "extracellular") ~ "extracellular",
-      str_detect(Description, "cytoplasm|intracellular") ~ "cytoplasm",
-      str_detect(Description, "membrane") ~ "membrane",
-      TRUE ~ "other/various"
-    )
-  )
-```
-
-# Save Results
-
-```{r save_results}
-#| cache: true
-
-# Save individual dataset results
-for (ds in names(limma_results_list)) {
-
-  result_table <- limma_results_list[[ds]]$results %>%
-    dplyr::select(nterm_modif_peptide, contrast, logFC, AveExpr, t, P.Value, adj.P.Val, 
-           regulation, dataset, everything()) %>%
-    dplyr::arrange(contrast, adj.P.Val) %>%
-    left_join(
-      prot2gene,
-      by = c("protein" = "protein")
-    ) %>%
-    # add GroupGO info if available
-    left_join(go_cc_mapping, by = c("gene" = "gene")) %>%
-      mutate(
-        extracellular_or_cytoplasm = case_when(
-          is.na(extracellular_or_cytoplasm) ~ "other/various",
-          TRUE ~ extracellular_or_cytoplasm
-        )) 
-
-  write_tsv(
-    result_table,
-    file.path(results_dir, paste0(pre_fix, "_differential_analysis_", ds, ".tsv"))
-  )
-}
-
-# Save combined results
-if (exists("all_results_combined")) {
-
-  all_results_combined <- all_results_combined %>%
-    # add GroupGO info if available
-    left_join(
-      protein_annotation
-    ) %>%
-      # EXPERIMENT-SPECIFIC: set protein annotation path (Uniprot TSV for your proteome).
-      protein_annotation <- read_tsv(
-        "Z:/0_people/mcosenza/fastas_and_organims_annotations/org_annotations/human/uniprotkb_proteome_UP000005640_AND_mode_2025_08_13.tsv"
-      ) %>%
-
-  limma_results <- list(
-    by_dataset = limma_results_list,
-    all_results = all_results_combined
-  )
-  
-  # Save results
-  write_rds(limma_results, file.path(rds_dir, paste0(pre_fix, "_limma_results.rds")))
-  
-  write_tsv(
-    all_results_combined %>%
-      dplyr::select(nterm_modif_peptide, contrast, logFC, AveExpr, t, P.Value, adj.P.Val, 
-             regulation, dataset, everything()) %>%
-      # already joined above; avoid re-joining to prevent name clashes (.x/.y)
-      mutate(
-        extracellular_or_cytoplasm = dplyr::coalesce(extracellular_or_cytoplasm, "other/various")
-      ) %>%
-      dplyr::arrange(dataset, contrast, adj.P.Val),
-    file.path(results_dir, paste0(pre_fix, "_differential_analysis_combined.tsv"))
-  )
-}
-
-message("✓ Results saved to: ", results_dir)
 ```
 
 # Session Information

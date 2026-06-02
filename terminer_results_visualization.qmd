@@ -46,47 +46,12 @@ suppressPackageStartupMessages({
 # Avoid lazy-load cache buffer issues in large objects
 knitr::opts_chunk$set(cache.lazy = FALSE)
 
-# Set parameters
-rds_dir <- here("rds")
-results_dir <- here("results")
-plot_width <- 12
-plot_height <- 8
-# EXPERIMENT-SPECIFIC: update thresholds for your study.
-fc_threshold <- 1.2
-pval_threshold <- 0.05
-
-# EXPERIMENT-SPECIFIC: update prefix used for inputs/outputs from other scripts.
-pre_fix <- "xx000_projectname_analysis_type"
-
-# EXPERIMENT-SPECIFIC: set protein annotation path (Uniprot TSV table of the proteome used for the search).
-protein_annotation_path <- "Z:/xxxx/xxxx/xxxx/.../uniprotkb_proteome_UP000005640_AND_mode_2025_08_13.tsv"
-
-# EXPERIMENT-SPECIFIC: select normalization dataset(s) of interest.
-# Options available in this notebook environment: "protnorm_pure", "protnorm_with_lost", "non_protnorm", "protein_abund_norm" refers to protein-level analysis
-dataset_of_interest <- c("protnorm_with_lost", "non_protnorm", "protein_abund_norm")
-
-# EXPERIMENT-SPECIFIC: define condition levels in your experimental design.
-
-condition_levels <- c(
-  "NAT", 
-  "PC",
-  "Tumor"
+source(here("scr/helper_functions.R"))
+config <- load_stage_parameters(
+  stage = "results_visualization",
+  config_path = default_pipeline_config_path()
 )
-
-# EXPERIMENT-SPECIFIC: define contrast levels matching your contrasts in inferential analysis.
-
-contrast_levels <- c(
-  "Tumor_v_NAT", 
-  "PC_v_NAT",
-  "Tumor_v_PC"
-)
-
-# EXPERIMENT-SPECIFIC: set sequence logo options (dagLogo).
-run_sequence_logos <- FALSE
-# Optional filters (NULL means all). Use names from `contrast_levels` and
-# detected values in volcano_data_after_w_go$nterm_modif.
-sequence_logo_contrasts <- NULL
-sequence_logo_nterm_modifs <- NULL
+dir.create(results_dir, showWarnings = FALSE, recursive = TRUE)
 ```
 
 ```{r load_data}
@@ -102,8 +67,6 @@ all_results <- limma_results$all_results %>%
   filter(dataset %in% dataset_of_interest)
 
 params <- exploratory_results$parameters
-
-pre_fix <- params$pre_fix
 
 # New: SE with protein-normalized peptides plus lost ones, and the non-protein-normalized SE
 se_with_lost <- exploratory_results$se_pept_protnorm_with_lost
@@ -130,7 +93,7 @@ if (file.exists(go_results_path)) {
 
 # load go grouping table
 
-go_groups_path <- file.path(here(rds_dir), paste0(pre_fix, "_go_cc_mapping.rds"))
+go_groups_path <- file.path(rds_dir, paste0(pre_fix, "_go_cc_mapping.rds"))
 
 if (file.exists(go_groups_path)) {
 
@@ -867,23 +830,46 @@ if (!is.null(all_results) && all(c("dataset", "contrast", "nterm_modif_peptide",
 ```{r}
 # prepare gene-ontology grouping 
 
-go_annotation_df <- as.data.frame(go_groups_df$protnorm_with_lost@result) %>%
-  dplyr::rename(
-    go_id = ID,
-    go_description = Description,
-    gene = geneID
-  ) %>%
-  dplyr::select(
-    go_id,
-    go_description,
-    gene
-  ) %>%
-  distinct() %>%
-  separate_rows(gene, sep = "/") %>%
-  dplyr::filter(
-    !is.na(gene),
-    gene != ""
+available_go_group_datasets <- if (is.null(go_groups_df)) {
+  character()
+} else {
+  names(go_groups_df)[vapply(go_groups_df, function(x) !is.null(x), logical(1))]
+}
+
+preferred_go_group_datasets <- c("protnorm_with_lost", "non_protnorm", "protein_abund_norm")
+go_group_dataset <- preferred_go_group_datasets[preferred_go_group_datasets %in% available_go_group_datasets][1]
+
+if (is.na(go_group_dataset)) {
+  go_group_dataset <- available_go_group_datasets[1]
+}
+
+if (length(go_group_dataset) == 1 && !is.na(go_group_dataset)) {
+  go_annotation_df <- as.data.frame(go_groups_df[[go_group_dataset]]@result) %>%
+    dplyr::rename(
+      go_id = ID,
+      go_description = Description,
+      gene = geneID
+    ) %>%
+    dplyr::select(
+      go_id,
+      go_description,
+      gene
+    ) %>%
+    distinct() %>%
+    separate_rows(gene, sep = "/") %>%
+    dplyr::filter(
+      !is.na(gene),
+      gene != ""
+    )
+} else {
+  message("No GO grouping annotation available; assigning GO compartments as 'other'.")
+
+  go_annotation_df <- tibble::tibble(
+    go_id = character(),
+    go_description = character(),
+    gene = character()
   )
+}
 
 # merge GO annotation with volcano data
 
@@ -907,8 +893,8 @@ volcano_data_after_w_go <- volcano_data_after %>%
   ) %>%
   mutate(
     extracellular_or_cytoplasm = case_when(
-      str_detect(go_description, "extracellular") ~ "extracellular",
-      str_detect(go_description, "cytoplasm|intracellular") ~ "intracellular|cytoplasm",
+      str_detect(coalesce(go_description, ""), "extracellular") ~ "extracellular",
+      str_detect(coalesce(go_description, ""), "cytoplasm|intracellular") ~ "intracellular|cytoplasm",
       TRUE ~ "other"
     )
   )
@@ -1354,5 +1340,9 @@ sessionInfo()
 ```
 
 ```{r}
-str(go_groups_df$protnorm_with_lost@result)
+if (length(available_go_group_datasets) > 0) {
+  str(go_groups_df[[available_go_group_datasets[1]]]@result)
+} else {
+  message("No GO grouping results loaded.")
+}
 ```
