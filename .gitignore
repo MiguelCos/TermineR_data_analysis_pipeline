@@ -47,3 +47,7 @@ po/*~
 
 # RStudio Connect folder
 rsconnect/
+
+# internal reference files
+reference_files/
+data/example_fragpipe_tmt_search/

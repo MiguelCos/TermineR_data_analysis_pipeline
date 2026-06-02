@@ -1,0 +1,102 @@
+common:
+  search_engine: diann
+
+  diann_report_location: data/path_to_diann_report/report.tsv
+  fragpipe_parent_dir: null
+  fragpipe_lf_parent_dir: null
+  fragpipe_lf_annotation: null
+  fragpipe_hl_file: null
+  fragpipe_hl_annotation: null
+  spectronaut_report: null
+
+  location_annotation: data/XX000_experimental_metadata_file.txt
+  fasta_location: data/path_to_proteome/proteome.fasta
+  uniprot_annotation: data/path_to_uniprot/uniprot_annotation.tsv
+  protein_annotation_path: data/path_to_uniprot/uniprot_annotation.tsv
+
+  rds_dir: rds
+  results_dir: results
+
+  sense_protease: C
+  specificity_protease: K|R
+  organism_annotation: human
+  instrument: TF
+
+  ref_sample: norm
+  min_purity: 0.5
+  tmt_delta: "229"
+  proteotypic_only: true
+  summarization_method: SUM
+
+  missing_accepted: 0.5
+  tune_sigma: 1
+  tune_quantile: 0.0000001
+  pre_fix: xx000_projectname_analysis_type
+
+  interesting_specificity:
+    - semi_Nterm
+    - semi_Cterm
+  interesting_nterm_modif:
+    - "n"
+    - Acetyl
+
+stages:
+  data_preparation:
+    plot_width: 10
+    plot_height: 10
+    side_by_side_scale: 2.0
+    plot_dpi: 300
+    pca_use_interest_only: false
+    do_batch_correction: false
+    run_imputation_diagnostics: false
+    imputation_tsv_max_mb: 50
+
+  exploratory:
+    plot_width: 10
+    plot_height: 10
+    side_by_side_scale: 2.0
+    plot_dpi: 300
+    pca_use_interest_only: false
+    do_batch_correction: false
+    run_imputation_diagnostics: false
+    imputation_tsv_max_mb: 50
+
+  inferential:
+    plot_width: 10
+    plot_height: 8
+    fc_threshold: 1.2
+    pval_threshold: 0.05
+    run_go_analysis: false
+    use_blocking: false
+    blocking_column: replicate
+    interesting_processing_type:
+      - not_canonical
+    defined_contrasts:
+      Tumor_v_NAT: Tumor - NAT
+      Tumor_v_PC: Tumor - PC
+      PC_v_NAT: PC - NAT
+    datasets_to_analyze:
+      - protnorm_with_lost
+      - non_protnorm
+      - protein_abund_norm
+
+  results_visualization:
+    plot_width: 12
+    plot_height: 8
+    fc_threshold: 1.2
+    pval_threshold: 0.05
+    dataset_of_interest:
+      - protnorm_with_lost
+      - non_protnorm
+      - protein_abund_norm
+    condition_levels:
+      - NAT
+      - PC
+      - Tumor
+    contrast_levels:
+      - Tumor_v_NAT
+      - PC_v_NAT
+      - Tumor_v_PC
+    run_sequence_logos: false
+    sequence_logo_contrasts: null
+    sequence_logo_nterm_modifs: null

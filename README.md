@@ -58,6 +58,7 @@ The following R packages are required:
 **CRAN packages:**
 - `tidyverse`
 - `here`
+- `yaml`
 - `ggpubr`
 - `pheatmap`
 - `RColorBrewer`
@@ -135,84 +136,183 @@ EX006	Treatment_3	Treatment	3	B	24h
 - **Description**: Protein sequence database used for the search
 - **Format**: Standard FASTA format
 
-### 4. TargetP results (optional)
-- **Location**: `data/targetp_results.targetp2`
-- **Description**: TargetP2 prediction results for subcellular localization
-- **Format**: TargetP2 output format
-- **Note**: Set `targetp_location <- NULL` if not available
+### 4. TargetP processing annotations
+- **Description**: TargetP-aware processing annotations are provided by the updated `TermineR::annotate_neo_termini()` for supported organisms.
+- **Configuration**: No external TargetP2 output file is required by this pipeline.
 
 ## Configuration parameters
 
-### Search engine selection
-```r
-search_engine <- "diann"  # Options: "diann", "fragpipe_tmt", "fragpipe_lf", "fragpipe_heavy_light", "spectronaut"
+All pipeline notebooks now load their parameters from `config.yaml` at the repository root. Update that file once per project instead of editing each notebook separately.
+
+Paths in `config.yaml` can be either:
+- relative to the repository root, for example `data/report.tsv`
+- absolute paths, for example `Z:/project/data/report.tsv`
+
+Use `null` for optional inputs that are not relevant to your workflow.
+
+### Configuration structure
+```yaml
+common:
+  search_engine: diann
+  pre_fix: mc001_project_name
+  rds_dir: rds
+  results_dir: results
+
+stages:
+  data_preparation:
+    plot_width: 10
+  exploratory:
+    plot_width: 10
+  inferential:
+    defined_contrasts:
+      Treatment_vs_Control: Treatment - Control
+  results_visualization:
+    condition_levels:
+      - Control
+      - Treatment
 ```
 
-### Data locations (configure based on search engine)
+The `common` section stores parameters shared across the pipeline, while `stages` contains notebook-specific overrides for `data_preparation`, `exploratory`, `inferential`, and `results_visualization`.
+
+### Common parameters
+
+| Parameter | Description | Typical value |
+| --- | --- | --- |
+| `search_engine` | Search-engine adapter to use. Supported values are `diann`, `fragpipe_tmt`, `fragpipe_lf`, `fragpipe_heavy_light`, and `spectronaut`. | `diann` |
+| `diann_report_location` | Path to the DIA-NN `report.tsv` or `report.parquet` file. Used only when `search_engine: diann`. | `data/report.tsv` |
+| `fragpipe_parent_dir` | Parent directory containing FragPipe TMT mix folders such as `mix_1/`, `mix_2/`. Used only for TMT workflows. | `data/fragpipe_tmt_search` |
+| `fragpipe_lf_parent_dir` | Parent directory for FragPipe label-free outputs. Used only for label-free workflows. | `data/fragpipe_lf_search` |
+| `fragpipe_lf_annotation` | Annotation file for FragPipe label-free workflows. | `data/fragpipe_lf_annotation.txt` |
+| `fragpipe_hl_file` | Path to the `combined_modified_peptide_label_quant.tsv` file for heavy-light workflows. | `data/combined_modified_peptide_label_quant.tsv` |
+| `fragpipe_hl_annotation` | Annotation file for heavy-light workflows. | `data/fragpipe_hl_annotation.txt` |
+| `spectronaut_report` | Path to the Spectronaut report file. Used only for Spectronaut workflows. | `data/spectronaut_report.tsv` |
+| `location_annotation` | Experimental design file used to define samples, conditions, and biological replicates. | `data/experimental_annotation.txt` |
+| `fasta_location` | FASTA file used for TermineR peptide annotation. | `data/proteome.fasta` |
+| `uniprot_annotation` | UniProt annotation table used to build protein-to-gene mappings during upstream processing. | `data/uniprot_annotation.tsv` |
+| `protein_annotation_path` | UniProt annotation table used downstream in inferential and visualization steps for protein descriptions and gene names. | `data/uniprot_annotation.tsv` |
+| `rds_dir` | Directory where cached intermediate `.rds` objects are written. | `rds` |
+| `results_dir` | Directory where tabular outputs are written. | `results` |
+| `sense_protease` | Cleavage direction expected by TermineR. Use `C` for trypsin-like C-terminal cleavage and `N` for N-terminal cleavage. | `C` |
+| `specificity_protease` | Protease specificity pattern passed to TermineR annotation. | `K|R` |
+| `organism_annotation` | Organism keyword passed to TermineR annotation functions. | `human` |
+| `instrument` | Prefix used to identify quantitative sample columns in search-engine outputs. | `TF` |
+| `ref_sample` | Reference channel name for FragPipe TMT normalization. | `norm` |
+| `min_purity` | Minimum reporter-ion purity accepted for FragPipe TMT PSMs. | `0.5` |
+| `tmt_delta` | TMT delta mass used by the FragPipe TMT adapter. Use `229` for TMT10/11 and `304` for TMT16. | `"229"` |
+| `proteotypic_only` | If `true`, keep only proteotypic peptides in DIA-NN and Spectronaut workflows. | `true` |
+| `summarization_method` | Precursor summarization used in DIA-NN loading. Supported values are `SUM` and `MAX`. | `SUM` |
+| `missing_accepted` | Maximum missing fraction allowed within a condition before a feature is treated as too sparse for direct use. | `0.5` |
+| `tune_sigma` | Multiplicative factor applied to the imputation standard deviation for minimum-probability sampling. | `1` |
+| `tune_quantile` | Low quantile used to estimate the sample-specific imputation floor. | `0.0000001` |
+| `pre_fix` | Prefix used to name cached `.rds` files and result tables across the entire pipeline. | `terminer_analysis_01` |
+| `interesting_specificity` | Specificity classes considered “in scope” for PCA and downstream feature filtering. | `[semi_Nterm, semi_Cterm]` |
+| `interesting_nterm_modif` | N-terminal modification classes considered "in scope" for PCA and downstream filtering. Quote `"n"` in YAML so it is not parsed as a boolean. | `["n", Acetyl]` |
+
+**Available organisms**: `human`, `mouse`, `arabidopsis`, `medicago_truncatula`, `rhizobium_meliloti`, `pig`, `human_iso`, `ecoli`
+
+### Stage parameters
+
+#### `stages.data_preparation`
+
+| Parameter | Description | Typical value |
+| --- | --- | --- |
+| `plot_width` | Default figure width for plots generated in the data-preparation notebook. | `10` |
+| `plot_height` | Default figure height for plots generated in the data-preparation notebook. | `10` |
+| `side_by_side_scale` | Scale factor used when arranging multiple panels side by side. | `2.0` |
+| `plot_dpi` | Plot export DPI when high-resolution figures are rendered. | `300` |
+| `pca_use_interest_only` | If `true`, PCA uses only features flagged by `interesting_specificity` and `interesting_nterm_modif`. | `false` |
+| `do_batch_correction` | If `true`, run batch correction with ComBat where supported in the notebook. | `false` |
+| `run_imputation_diagnostics` | If `true`, render cached imputation diagnostic plots after loading saved outputs. | `false` |
+| `imputation_tsv_max_mb` | Maximum TSV size allowed for reloading cached imputation summaries when diagnostics are enabled. | `50` |
+
+#### `stages.exploratory`
+
+These parameters have the same meaning as in `stages.data_preparation`, but apply to `terminer_exploratory_analysis.qmd`.
+
+| Parameter | Description | Typical value |
+| --- | --- | --- |
+| `plot_width` | Default figure width for exploratory plots. | `10` |
+| `plot_height` | Default figure height for exploratory plots. | `10` |
+| `side_by_side_scale` | Scale factor for side-by-side plot layouts. | `2.0` |
+| `plot_dpi` | Plot export DPI. | `300` |
+| `pca_use_interest_only` | Restrict PCA to the configured “interesting” feature scope. | `false` |
+| `do_batch_correction` | Enable ComBat batch correction. | `false` |
+| `run_imputation_diagnostics` | Enable reloading and plotting cached imputation diagnostics. | `false` |
+| `imputation_tsv_max_mb` | Maximum TSV size allowed for cached imputation diagnostics. | `50` |
+
+#### `stages.inferential`
+
+| Parameter | Description | Typical value |
+| --- | --- | --- |
+| `plot_width` | Default figure width for inferential plots. | `10` |
+| `plot_height` | Default figure height for inferential plots. | `8` |
+| `fc_threshold` | Fold-change threshold used to classify features as upregulated or downregulated. | `1.2` |
+| `pval_threshold` | Adjusted p-value threshold used for significance calls. | `0.05` |
+| `run_go_analysis` | If `true`, build GO enrichment and GroupGO-derived GO compartment tables from the saved limma results. If `false`, the inferential notebook writes limma outputs only. | `false` |
+| `use_blocking` | If `true`, limma runs duplicate-correlation blocking for repeated-measures designs. If `false`, limma runs without a blocking factor. | `false` |
+| `blocking_column` | Experimental-design column to use when `use_blocking` is enabled. The loader standardizes `replicate` and `bio_replicate` so either can be supplied in the annotation file. | `replicate` |
+| `interesting_processing_type` | Processing types to emphasize in downstream interpretation when applicable. | `[not_canonical]` |
+| `defined_contrasts` | Named list of limma contrast formulas. Keys become contrast names in output files. | `Tumor_v_NAT: Tumor - NAT` |
+| `datasets_to_analyze` | Which processed datasets should be passed into limma and enrichment analysis. Supported values include `protnorm_pure`, `protnorm_with_lost`, `non_protnorm`, and `protein_abund_norm`. | `[protnorm_with_lost, non_protnorm, protein_abund_norm]` |
+
+#### `stages.results_visualization`
+
+| Parameter | Description | Typical value |
+| --- | --- | --- |
+| `plot_width` | Default figure width for visualization outputs. | `12` |
+| `plot_height` | Default figure height for visualization outputs. | `8` |
+| `fc_threshold` | Fold-change threshold used to color volcano plots and summarize regulation status. | `1.2` |
+| `pval_threshold` | Adjusted p-value threshold used in volcano plots and result summaries. | `0.05` |
+| `dataset_of_interest` | Datasets from the limma results to display in visualization outputs. | `[protnorm_with_lost, non_protnorm, protein_abund_norm]` |
+| `condition_levels` | Ordered factor levels for conditions in plots and summaries. | `[NAT, PC, Tumor]` |
+| `contrast_levels` | Ordered factor levels for contrasts in plots and summaries. These should match the names in `defined_contrasts`. | `[Tumor_v_NAT, PC_v_NAT, Tumor_v_PC]` |
+| `run_sequence_logos` | If `true`, build sequence-logo visualizations with `dagLogo`. | `false` |
+| `sequence_logo_contrasts` | Optional subset of contrasts to include in sequence logos. Use `null` to include all configured contrasts. | `null` |
+| `sequence_logo_nterm_modifs` | Optional subset of N-terminal modifications to include in sequence logos. Use `null` to include all available modifications. | `null` |
+
+### Search-engine examples
 
 #### DIA-NN configuration
-```r
-search_engine <- "diann"
-diann_report_location <- here("initial_data/report.parquet")  # or .tsv
-proteotypic_only <- TRUE
-summarization_method <- "SUM"  # or "MAX"
+```yaml
+common:
+  search_engine: diann
+  diann_report_location: data/report.parquet
+  proteotypic_only: true
+  summarization_method: SUM
 ```
 
 #### FragPipe TMT configuration
-```r
-search_engine <- "fragpipe_tmt"
-fragpipe_parent_dir <- here("initial_data/fragpipe_search")  # Directory with mix_1, mix_2, etc.
-ref_sample <- "norm"  # Reference channel name
-min_purity <- 0.5
-tmt_delta <- "229"  # "229" for TMT10/11, "304" for TMT16
+```yaml
+common:
+  search_engine: fragpipe_tmt
+  fragpipe_parent_dir: data/fragpipe_search
+  ref_sample: norm
+  min_purity: 0.5
+  tmt_delta: "229"
 ```
 
 #### FragPipe label-free configuration
-```r
-search_engine <- "fragpipe_lf"
-fragpipe_lf_parent_dir <- here("initial_data/fragpipe_lf_search")
-fragpipe_lf_annotation <- here("initial_data/fragpipe_lf_annotation.txt")
+```yaml
+common:
+  search_engine: fragpipe_lf
+  fragpipe_lf_parent_dir: data/fragpipe_lf_search
+  fragpipe_lf_annotation: data/fragpipe_lf_annotation.txt
 ```
 
 #### FragPipe heavy-light configuration
-```r
-search_engine <- "fragpipe_heavy_light"
-fragpipe_hl_file <- here("initial_data/combined_modified_peptide_label_quant.tsv")
-fragpipe_hl_annotation <- here("initial_data/fragpipe_hl_annotation.txt")
+```yaml
+common:
+  search_engine: fragpipe_heavy_light
+  fragpipe_hl_file: data/combined_modified_peptide_label_quant.tsv
+  fragpipe_hl_annotation: data/fragpipe_hl_annotation.txt
 ```
 
 #### Spectronaut configuration
-```r
-search_engine <- "spectronaut"
-spectronaut_report <- here("initial_data/spectronaut_report.tsv")
-proteotypic_only <- TRUE
-```
-
-### Experimental parameters
-```r
-sense_protease <- "C"  # "C" for C-terminal cleavage (trypsin), "N" for N-terminal
-specificity_protease <- "K|R"  # Protease specificity (trypsin: "K|R")
-organism_annotation <- "human"  # Organism for annotation
-instrument <- "EX"  # Instrument prefix in sample names
-```
-
-**Available organisms**: `"human"`, `"mouse"`, `"arabidopsis"`, `"medicago_truncatula"`, `"rhizobium_meliloti"`, `"pig"`, `"human_iso"`, `"ecoli"`
-
-### Analysis parameters
-```r
-missing_accepted <- 2 / 4  # Maximum missing values per condition (2 out of 4 replicates)
-fc_threshold <- 2.5  # Fold-change threshold for significance
-pval_threshold <- 0.05  # P-value threshold for significance
-pre_fix <- "terminer_analysis_"  # Prefix for output files
-```
-
-### Contrast definition
-```r
-defined_contrasts <- c(
-  "Treatment_vs_Control" = "Treatment - Control",
-  "Condition2_vs_Control" = "Condition2 - Control"
-  # Add more contrasts as needed
-)
+```yaml
+common:
+  search_engine: spectronaut
+  spectronaut_report: data/spectronaut_report.tsv
+  proteotypic_only: true
 ```
 
 ## Running the analysis
@@ -225,7 +325,6 @@ project_root/
 │   ├── report.parquet (or report.tsv)
 │   ├── experimental_annotation.txt
 │   ├── proteome.fasta
-│   ├── targetp_results.targetp2 (optional)
 │   └── example_annotation.txt (optional)
 ├── scr/                    # Helper scripts
 │   ├── modif_diann_adapter.R
@@ -242,7 +341,7 @@ project_root/
 ### 2. Data preparation step
 
 1. Open `terminer_data_preparation.qmd`.
-2. Update the parameter section with your specific settings.
+2. Update `config.yaml` with your project-specific paths and analysis settings.
 3. Execute the script to perform
    - Data loading and formating.
    - Missing value analysis.
@@ -251,7 +350,7 @@ project_root/
 
 ### 2. Exploratory analysis
 1. Open `terminer_exploratory_analysis.qmd`
-2. Update the parameter section with your specific settings
+2. Confirm `config.yaml` contains the correct exploratory settings
 3. Execute the script to perform:
    - Data loading and quality control
    - Peptide annotation with TermineR
@@ -262,11 +361,11 @@ project_root/
 
 ### 3. Inferential analysis
 1. Open `terminer_inferential_analysis.qmd`
-2. Define your experimental contrasts
+2. Define your experimental contrasts in `config.yaml` under `stages.inferential.defined_contrasts`
 3. Execute the script to perform:
    - Protein-level normalization
    - Differential abundance analysis with limma
-   - GO enrichment analysis
+  - Optional GO enrichment analysis
    - Statistical results generation
 
 ### 4. Results visualization
@@ -281,7 +380,8 @@ project_root/
 
 ### Results directory (`results/`)
 - `*_differential_analysis_results.tsv`: Complete differential analysis results
-- `*_go_enrichment_results.tsv`: GO enrichment analysis results
+- `*_go_enrichment_results.tsv`: Optional GO enrichment analysis results
+- `*_go_cc_mapping.tsv`: Optional gene-to-GO compartment summary derived from GroupGO
 - `*_summary_statistics.tsv`: Summary of analysis results
 
 ### RDS cache directory (`rds/`)
