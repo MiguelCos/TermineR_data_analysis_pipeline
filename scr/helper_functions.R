@@ -513,113 +513,171 @@ create_regulation_heatmap <- function(results_data, top_n = 50, fc_threshold = 2
   )
 }
 
+#' Complete partial missing values with robust sequential imputation
+#' @param counts Numeric feature-by-sample matrix with finite observations and NAs
+#' @return Complete matrix in the input order, preserving all observed values
+impute_partial_missing_values <- function(counts) {
+  if (!anyNA(counts)) {
+    return(counts)
+  }
+
+  if (!requireNamespace("rrcovNA", quietly = TRUE)) {
+    stop("Package 'rrcovNA' is required to impute remaining partial missing values. Install it before rerunning imputation.")
+  }
+
+  imputation_result <- tryCatch(
+    rrcovNA::impSeqRob(counts),
+    error = function(error) {
+      stop("Partial-missing imputation failed: ", conditionMessage(error), call. = FALSE)
+    }
+  )
+
+  # rrcovNA returns xseq on its EM fallback and x on its sequential path.
+  imputed_counts <- imputation_result[["x"]]
+  if (is.null(imputed_counts)) {
+    imputed_counts <- imputation_result[["xseq"]]
+  }
+
+  if (!is.matrix(imputed_counts) || !is.numeric(imputed_counts) ||
+      !identical(dim(imputed_counts), dim(counts)) ||
+      !setequal(rownames(imputed_counts), rownames(counts)) ||
+      !setequal(colnames(imputed_counts), colnames(counts))) {
+    stop("Partial-missing imputation returned incompatible matrix dimensions or feature/sample names.")
+  }
+
+  imputed_counts <- imputed_counts[rownames(counts), colnames(counts), drop = FALSE]
+  missing_values <- is.na(counts)
+  if (any(!is.finite(imputed_counts[missing_values]))) {
+    stop("Partial-missing imputation left missing or non-finite values. Check the retained data before rerunning.")
+  }
+
+  counts[missing_values] <- imputed_counts[missing_values]
+  return(counts)
+}
+
 #' Impute missing values and return imputation summary
-#' @param se SummarizedExperiment with assay named 'counts'
-#' @param min_fraction_condition Minimum fraction of non-missing values required in a condition to keep a feature (numeric 0-1)
-#' @param min_fraction_replicate Minimum fraction across replicates (currently used as a secondary filter) (numeric 0-1)
-#' @param min_n_peptides Minimum number of peptides/features required to consider (currently treated as minimum non-missing per condition)
-#' @return List with the imputed SummarizedExperiment, imputation summary table, and sparse-feature exclusion metadata
+#' @param se SummarizedExperiment with a numeric, log2-scale matrix assay named 'counts'
+#' @param min_fraction_condition Maximum missing fraction allowed within a condition
+#'   before using minimum-probability imputation (numeric 0-1). Features exceeding
+#'   this fraction in every condition are excluded. The historical argument name
+#'   is retained for compatibility; fractions count samples, not biological IDs.
+#' @param tune_sigma Non-negative multiplier for the median feature standard deviation
+#' @param tune_quantile Sample-specific low quantile for minimum-probability sampling (0-1)
+#' @param seed Non-negative integer random seed, default 1. NULL uses the caller's
+#'   random stream. With a seed, the caller's R random state is restored on exit.
+#' @return List with the imputed SummarizedExperiment, imputation summary table,
+#'   and sparse-feature exclusion metadata. Total_Samples is the missingness
+#'   denominator; Total_Replicates records distinct biological replicate IDs.
 terminer_imputation <- function(se,
                                 min_fraction_condition = 0.5,
                                 tune_sigma = 1,
-                                tune_quantile = 1e-7) {
-  # This function implements the same tidy pipeline used in OS001_TermineR_exploratory_refined_loose_missingness_v2.qmd
-  # - characterise missingness per peptide per condition
-  # - remove sparse features (missing in all conditions beyond threshold)
-  # - impute "Total_Missing" features using a minimum-probability sampling per sample
-  # - impute "Partial_Missing" features using impSeqRob (if available)
-  # Returns a SummarizedExperiment with imputed assay 'counts' and attribute 'imputation_summary_table'
-
+                                tune_quantile = 1e-7,
+                                seed = 1L) {
   if (!requireNamespace("SummarizedExperiment", quietly = TRUE)) stop("SummarizedExperiment required")
   if (!requireNamespace("dplyr", quietly = TRUE)) stop("dplyr required")
   if (!requireNamespace("tidyr", quietly = TRUE)) stop("tidyr required")
   if (!requireNamespace("tibble", quietly = TRUE)) stop("tibble required")
 
+  parameters <- list(
+    min_fraction_condition = min_fraction_condition,
+    tune_sigma = tune_sigma,
+    tune_quantile = tune_quantile
+  )
+  for (parameter_name in names(parameters)) {
+    value <- parameters[[parameter_name]]
+    upper_limit <- if (parameter_name == "tune_sigma") Inf else 1
+    if (!is.numeric(value) || length(value) != 1L || !is.finite(value) ||
+        value < 0 || value > upper_limit) {
+      stop(parameter_name, " must be a finite numeric scalar between 0 and ", upper_limit, ".")
+    }
+  }
+  if (!is.null(seed) && (!is.numeric(seed) || length(seed) != 1L ||
+      !is.finite(seed) || seed < 0 || seed > .Machine$integer.max || seed != floor(seed))) {
+    stop("seed must be NULL or a non-negative integer no greater than ", .Machine$integer.max, ".")
+  }
+
   counts <- SummarizedExperiment::assay(se, "counts")
-  if (is.null(counts) || !is.matrix(counts)) stop("Assay 'counts' not found or not a matrix in the provided SummarizedExperiment.")
+  if (!is.matrix(counts) || !is.numeric(counts)) {
+    stop("Assay 'counts' must be a numeric matrix in the provided SummarizedExperiment.")
+  }
+  if (nrow(counts) == 0L || ncol(counts) == 0L) {
+    stop("Assay 'counts' must contain at least one feature and one sample.")
+  }
+  if (any(!is.finite(counts) & !is.na(counts))) {
+    stop("Assay 'counts' contains infinite values. Supply finite log2 abundances or NA.")
+  }
+  if (is.null(rownames(counts)) || is.null(colnames(counts)) ||
+      anyNA(rownames(counts)) || anyNA(colnames(counts)) ||
+      any(rownames(counts) == "") || any(colnames(counts) == "") ||
+      anyDuplicated(rownames(counts)) || anyDuplicated(colnames(counts))) {
+    stop("Assay 'counts' must have unique, non-empty feature and sample names.")
+  }
   n_features_input <- nrow(counts)
 
-  # Prepare experimental_design from colData
+  # Prepare sample metadata and require exact alignment with the assay.
   col_ann <- as.data.frame(SummarizedExperiment::colData(se))
-  # ensure a 'sample' column exists that matches column names in counts
   if (!"sample" %in% names(col_ann)) {
-    col_ann <- col_ann %>% tibble::rownames_to_column(var = "sample")
-  } else if (any(col_ann$sample == "")) {
-    col_ann <- col_ann %>% tibble::rownames_to_column(var = ".tmp_rowname") %>% dplyr::mutate(sample = ifelse(sample == "", .tmp_rowname, sample)) %>% dplyr::select(-.tmp_rowname)
+    col_ann$sample <- colnames(counts)
+  } else {
+    col_ann$sample <- as.character(col_ann$sample)
+    missing_sample_names <- is.na(col_ann$sample) | col_ann$sample == ""
+    col_ann$sample[missing_sample_names] <- colnames(counts)[missing_sample_names]
+  }
+  samples <- col_ann$sample
+  if (!identical(samples, colnames(counts))) {
+    stop("colData$sample must match the assay column names in the same order.")
+  }
+  if (!"condition" %in% names(col_ann) || anyNA(col_ann$condition) ||
+      any(as.character(col_ann$condition) == "")) {
+    stop("colData must include a 'condition' column without missing or blank values.")
+  }
+  if (!"replicate" %in% names(col_ann)) {
+    if ("bio_replicate" %in% names(col_ann)) {
+      col_ann$replicate <- col_ann$bio_replicate
+    } else if ("Replicate" %in% names(col_ann)) {
+      col_ann$replicate <- col_ann$Replicate
+    } else {
+      col_ann$replicate <- samples
+    }
   }
 
-  # Ensure replicate column exists (some qmd uses 'replicate' variable)
-  if (!"replicate" %in% names(col_ann) && "Replicate" %in% names(col_ann)) {
-    col_ann <- col_ann %>% dplyr::rename(replicate = Replicate)
-  }
+  # Characterize missingness at the sample level within each condition.
+  condition_sizes <- col_ann %>%
+    dplyr::group_by(condition) %>%
+    dplyr::summarise(
+      Total_Samples = dplyr::n(),
+      Total_Replicates = dplyr::n_distinct(replicate),
+      .groups = "drop"
+    )
 
-  # Build quant_peptide_data similar to the qmd
-  samples <- as.character(col_ann$sample)
-  counts_df <- as.data.frame(counts) %>% tibble::rownames_to_column(var = "nterm_modif_peptide")
-
-  # select only columns present in counts and in experimental design (preserve order)
-  keep_samples <- intersect(samples, colnames(counts_df))
-  if (length(keep_samples) == 0) stop("No matching sample columns between SummarizedExperiment colData and assay columns")
-
-  quant_peptide_data <- counts_df %>% dplyr::select(nterm_modif_peptide, all_of(keep_samples))
-
-  # Step 1: Pivot to long and join experimental design
-  quant_peptide_data_long <- quant_peptide_data %>%
+  quant_peptide_data_long <- as.data.frame(counts) %>%
+    tibble::rownames_to_column(var = "nterm_modif_peptide") %>%
     tidyr::pivot_longer(cols = -nterm_modif_peptide, names_to = "sample", values_to = "Abundance") %>%
     dplyr::left_join(col_ann, by = "sample")
-
-  # normalize replicate name
-  if ("replicate" %in% names(quant_peptide_data_long)) {
-    quant_peptide_data_long <- quant_peptide_data_long %>% dplyr::rename(Replicate = replicate)
-  } else if (!"Replicate" %in% names(quant_peptide_data_long)) {
-    # if no replicate info present, create a dummy replicate = sample
-    quant_peptide_data_long <- quant_peptide_data_long %>% dplyr::mutate(Replicate = sample)
-  }
-
-  # Step 2: Calculate missingness per peptide per condition
-  if (!"condition" %in% names(quant_peptide_data_long)) stop("experimental design (colData) must include a 'condition' column for grouping")
-
-  Total_Replicates <- quant_peptide_data_long %>%
-    dplyr::group_by(condition) %>%
-    dplyr::summarise(Total_Replicates = n_distinct(Replicate)) %>%
-    dplyr::ungroup()
 
   peptide_missingness <- quant_peptide_data_long %>%
     dplyr::group_by(nterm_modif_peptide, condition) %>%
     dplyr::summarise(
       Num_Quantified_per_cond = sum(!is.na(Abundance)),
       Num_Missing_per_cond = sum(is.na(Abundance)),
-      .groups = 'drop'
+      .groups = "drop"
     ) %>%
-    dplyr::left_join(Total_Replicates, by = "condition") %>%
+    dplyr::left_join(condition_sizes, by = "condition") %>%
     dplyr::mutate(
-      Proportion_Missing = Num_Missing_per_cond / Total_Replicates,
+      Proportion_Missing = Num_Missing_per_cond / Total_Samples,
       Missingness_Category = dplyr::case_when(
-        Proportion_Missing <= 1 & Proportion_Missing > min_fraction_condition ~ "Total_Missing",
-        Proportion_Missing > 0 & Proportion_Missing <= min_fraction_condition ~ "Partial_Missing",
-        Proportion_Missing == 0 ~ "Complete",
-        TRUE ~ "Partial_Missing"
+        Proportion_Missing > min_fraction_condition ~ "Total_Missing",
+        Proportion_Missing > 0 ~ "Partial_Missing",
+        TRUE ~ "Complete"
       )
     ) %>%
+    dplyr::group_by(nterm_modif_peptide) %>%
+    dplyr::mutate(all_conditions_missing = all(Proportion_Missing > min_fraction_condition)) %>%
     dplyr::ungroup()
 
-  peptide_missingness_all <- peptide_missingness %>%
-    dplyr::group_by(nterm_modif_peptide) %>%
-    dplyr::summarize(
-      all_conditions_missing = all(Proportion_Missing > min_fraction_condition),
-      .groups = 'drop'
-    )
-
-  peptide_missingness <- peptide_missingness %>%
-    dplyr::left_join(peptide_missingness_all, by = "nterm_modif_peptide")
-
   sparse_feature_missingness <- peptide_missingness %>%
-    dplyr::filter(all_conditions_missing == TRUE)
-
-  sparse_features <- sparse_feature_missingness %>%
-    dplyr::pull(nterm_modif_peptide) %>%
-    unique()
-
+    dplyr::filter(all_conditions_missing)
+  sparse_features <- unique(sparse_feature_missingness$nterm_modif_peptide)
   n_sparse_features_excluded <- length(sparse_features)
   message(
     "Sparse-feature filter excluded ", n_sparse_features_excluded,
@@ -631,175 +689,138 @@ terminer_imputation <- function(se,
     dplyr::group_by(nterm_modif_peptide) %>%
     dplyr::summarise(
       n_conditions = dplyr::n_distinct(condition),
-      min_quantified_per_condition = min(Num_Quantified_per_cond, na.rm = TRUE),
-      max_quantified_per_condition = max(Num_Quantified_per_cond, na.rm = TRUE),
-      mean_missing_fraction = mean(Proportion_Missing, na.rm = TRUE),
-      .groups = 'drop'
+      min_quantified_per_condition = if (dplyr::n() > 0L) min(Num_Quantified_per_cond) else NA_integer_,
+      max_quantified_per_condition = if (dplyr::n() > 0L) max(Num_Quantified_per_cond) else NA_integer_,
+      mean_missing_fraction = mean(Proportion_Missing),
+      .groups = "drop"
     )
-
   sparse_feature_annotations <- as.data.frame(
     SummarizedExperiment::rowData(se)[sparse_features, , drop = FALSE]
   )
-
   if (nrow(sparse_feature_annotations) > 0 && !"nterm_modif_peptide" %in% names(sparse_feature_annotations)) {
     sparse_feature_annotations$nterm_modif_peptide <- rownames(sparse_feature_annotations)
   }
 
-  # Step 3: Filter out sparse features and merge missingness info
-  quant_peptide_data_long <- quant_peptide_data_long %>%
-    dplyr::filter(!nterm_modif_peptide %in% sparse_features) %>%
-    dplyr::left_join(peptide_missingness, by = c("nterm_modif_peptide", "condition"))
-
-  # Step 4: Imputation
-  # parameters
-  n_features <- length(unique(quant_peptide_data_long$nterm_modif_peptide))
-
-  # peptide_missingness_overall (in-memory)
-  peptide_missingness_overall <- quant_peptide_data_long %>%
-    dplyr::group_by(nterm_modif_peptide) %>%
-    dplyr::summarise(
-      Num_Quantified_overall = sum(!is.na(Abundance)),
-      Num_Missing_overall = sum(is.na(Abundance)),
-      .groups = 'drop'
-    ) %>%
-    dplyr::mutate(
-      Proportion_Missing_overall = Num_Missing_overall / n_features
-    ) %>%
-    dplyr::ungroup()
-
-  features_in_more_50perc <- peptide_missingness_overall %>% dplyr::filter(Proportion_Missing_overall <= 0.5) %>% dplyr::pull(nterm_modif_peptide)
-
-  protein_wise_sd <- quant_peptide_data_long %>%
-    dplyr::filter(nterm_modif_peptide %in% features_in_more_50perc) %>%
-    dplyr::group_by(nterm_modif_peptide) %>%
-    dplyr::summarise(sd = sd(Abundance, na.rm = TRUE)) %>%
-    dplyr::ungroup()
-
-  sd_median <- median(protein_wise_sd$sd, na.rm = TRUE) * tune_sigma
-
-  # min quantile value per sample
-  min_quantile_sample <- quant_peptide_data_long %>%
-    dplyr::group_by(sample) %>%
-    dplyr::summarise(min_per_sample = quantile(Abundance, prob = tune_quantile, na.rm = TRUE)) %>%
-    dplyr::ungroup()
-
-  sample_gausssian <- function(x){
-    sample(rnorm(n_features, mean = x, sd = sd_median), 1)
+  # Check the retained data before estimating any imputation distributions.
+  retained_features <- setdiff(rownames(counts), sparse_features)
+  if (length(retained_features) == 0L) {
+    stop("No features remain after the sparse-feature filter. Check the missingness threshold and input data.")
+  }
+  retained_counts <- counts[retained_features, , drop = FALSE]
+  empty_samples <- colnames(retained_counts)[colSums(!is.na(retained_counts)) == 0L]
+  if (length(empty_samples) > 0L) {
+    stop(
+      "Cannot impute samples with no observed values after sparse-feature filtering: ",
+      paste(empty_samples, collapse = ", "), ". Check or exclude these samples before rerunning."
+    )
   }
 
-  # initial imputation for Total_Missing
-  quant_peptide_data_long2 <- quant_peptide_data_long %>%
-    dplyr::left_join(min_quantile_sample, by = "sample") %>%
-    dplyr::rowwise() %>%
-    dplyr::mutate(
-      abundance_imputed = ifelse(
-        is.na(Abundance) & Missingness_Category == "Total_Missing",
-        yes = sample_gausssian(min_per_sample),
-        no = Abundance
-      )
-    ) %>%
-    dplyr::ungroup() %>%
-    dplyr::mutate(
-      imputation_method = dplyr::case_when(
-        is.na(Abundance) & Missingness_Category == "Total_Missing" ~ "minProb_dist",
-        is.na(Abundance) & Missingness_Category == "Partial_Missing" ~ "impSeqRob",
-        Missingness_Category == "Complete" ~ "not_imputed",
-        !is.na(Abundance) ~ "not_imputed",
-        TRUE ~ "not_imputed"
-      )
-    )
+  quant_peptide_data_long <- quant_peptide_data_long %>%
+    dplyr::filter(nterm_modif_peptide %in% retained_features) %>%
+    dplyr::left_join(peptide_missingness, by = c("nterm_modif_peptide", "condition")) %>%
+    dplyr::mutate(abundance_imputed = Abundance, imputation_method = "not_imputed")
 
-  # Step 4.2: Partial missing - use impSeqRob if available
-  # Prepare wide matrix of abundance_imputed
-  df_example_partial_missing_wide <- quant_peptide_data_long2 %>%
+  if (!is.null(seed) && anyNA(retained_counts)) {
+    had_random_seed <- exists(".Random.seed", envir = .GlobalEnv, inherits = FALSE)
+    if (had_random_seed) {
+      previous_random_seed <- get(".Random.seed", envir = .GlobalEnv, inherits = FALSE)
+    }
+    on.exit({
+      if (had_random_seed) {
+        assign(".Random.seed", previous_random_seed, envir = .GlobalEnv)
+      } else if (exists(".Random.seed", envir = .GlobalEnv, inherits = FALSE)) {
+        rm(".Random.seed", envir = .GlobalEnv)
+      }
+    }, add = TRUE)
+    set.seed(seed)
+  }
+
+  # Estimate the spread using features observed in at least half of all samples.
+  total_missing <- is.na(quant_peptide_data_long$Abundance) &
+    quant_peptide_data_long$Missingness_Category == "Total_Missing"
+  if (any(total_missing)) {
+    peptide_missingness_overall <- quant_peptide_data_long %>%
+      dplyr::group_by(nterm_modif_peptide) %>%
+      dplyr::summarise(
+        Num_Quantified_overall = sum(!is.na(Abundance)),
+        Num_Missing_overall = sum(is.na(Abundance)),
+        .groups = "drop"
+      ) %>%
+      dplyr::mutate(
+        Proportion_Missing_overall = Num_Missing_overall /
+          (Num_Quantified_overall + Num_Missing_overall)
+      )
+    sd_features <- peptide_missingness_overall %>%
+      dplyr::filter(Proportion_Missing_overall <= 0.5, Num_Quantified_overall >= 2L) %>%
+      dplyr::pull(nterm_modif_peptide)
+    feature_wise_sd <- quant_peptide_data_long %>%
+      dplyr::filter(nterm_modif_peptide %in% sd_features) %>%
+      dplyr::group_by(nterm_modif_peptide) %>%
+      dplyr::summarise(sd = stats::sd(Abundance, na.rm = TRUE), .groups = "drop")
+    sd_median <- stats::median(feature_wise_sd$sd, na.rm = TRUE) * tune_sigma
+    if (!is.finite(sd_median) || sd_median < 0) {
+      stop("Cannot estimate a finite imputation standard deviation from features observed in at least half of the samples and at least two samples.")
+    }
+
+    min_quantile_sample <- quant_peptide_data_long %>%
+      dplyr::group_by(sample) %>%
+      dplyr::summarise(
+        min_per_sample = stats::quantile(Abundance, probs = tune_quantile, na.rm = TRUE),
+        .groups = "drop"
+      )
+    quant_peptide_data_long <- quant_peptide_data_long %>%
+      dplyr::left_join(min_quantile_sample, by = "sample")
+    imputation_means <- quant_peptide_data_long$min_per_sample[total_missing]
+    if (any(!is.finite(imputation_means))) {
+      stop("Cannot estimate a finite sample-specific imputation floor.")
+    }
+
+    # Draw exactly one Gaussian value for each missing observation.
+    imputed_values <- stats::rnorm(n = sum(total_missing), mean = imputation_means, sd = sd_median)
+    if (any(!is.finite(imputed_values))) {
+      stop("Minimum-probability imputation produced non-finite values. Check tune_sigma and the input abundances.")
+    }
+    quant_peptide_data_long$abundance_imputed[total_missing] <- imputed_values
+    quant_peptide_data_long$imputation_method[total_missing] <- "minProb_dist"
+  }
+
+  # Only remaining missing observations require the robust imputation step.
+  partial_missing_counts <- quant_peptide_data_long %>%
     dplyr::select(nterm_modif_peptide, sample, abundance_imputed) %>%
-    tidyr::pivot_wider(names_from = sample, values_from = abundance_imputed)
-
-  # ensure columns order matches experimental design
-  wide_samples <- intersect(samples, colnames(df_example_partial_missing_wide))
-  mat_example_partial_missing_wide <- df_example_partial_missing_wide %>%
-    dplyr::select(nterm_modif_peptide, all_of(wide_samples)) %>%
+    tidyr::pivot_wider(names_from = sample, values_from = abundance_imputed) %>%
+    dplyr::select(nterm_modif_peptide, dplyr::all_of(samples)) %>%
     tibble::column_to_rownames(var = "nterm_modif_peptide") %>%
     as.matrix()
+  imputed_counts <- impute_partial_missing_values(partial_missing_counts)
 
-  mat_example_partial_missing_wide_imp <- NULL
-  if (requireNamespace("rrcovNA", quietly = TRUE)) {
-
-    q_example_partial_missing_wide_imp <- rrcovNA::impSeqRob(mat_example_partial_missing_wide)
-    # impSeqRob returns a list with element x containing imputed matrix
-    mat_example_partial_missing_wide_imp <- q_example_partial_missing_wide_imp$x
-
-  } else {
-
-    warning("Package 'rrcovNA' not available; 'Partial_Missing' features will not be imputed with impSeqRob. Install the package to enable this step.")
-    mat_example_partial_missing_wide_imp <- mat_example_partial_missing_wide
-  
-  }
-
-  # Step 5: Build final imputed dataframe
-  df_example_partial_missing_imp <- mat_example_partial_missing_wide_imp %>%
-    as.data.frame(stringsAsFactors = FALSE) %>%
+  # Label methods only after successful replacement and retain the audit columns.
+  imputed_data_long <- as.data.frame(imputed_counts) %>%
     tibble::rownames_to_column(var = "nterm_modif_peptide") %>%
-    tidyr::pivot_longer(
-      cols = -nterm_modif_peptide, 
-      names_to = "sample", 
-      values_to = "Abundance") %>%
+    tidyr::pivot_longer(cols = -nterm_modif_peptide, names_to = "sample", values_to = "Abundance") %>%
     dplyr::left_join(
-      quant_peptide_data_long2 %>% 
-      dplyr::select(-Abundance, -abundance_imputed),
-       by = c("nterm_modif_peptide", "sample")) %>%
+      dplyr::select(quant_peptide_data_long, -Abundance),
+      by = c("nterm_modif_peptide", "sample")
+    ) %>%
     dplyr::mutate(
-      imputation_method = dplyr::case_when(
-        is.na(imputation_method) ~ "not_imputed",
-        TRUE ~ imputation_method
-      )
+      imputation_method = dplyr::if_else(is.na(abundance_imputed), "impSeqRob", imputation_method)
+    )
+  imputation_summary_table <- imputed_data_long %>%
+    dplyr::select(
+      nterm_modif_peptide, sample,
+      dplyr::any_of(c(
+        "sample_name", "Num_Quantified_per_cond", "Num_Missing_per_cond",
+        "Proportion_Missing", "Total_Samples", "Total_Replicates",
+        "Missingness_Category", "imputation_method"
+      ))
     )
 
-  # imputation summary table
-  imputation_summary_table <- df_example_partial_missing_imp %>%
-    dplyr::select(
-      nterm_modif_peptide,
-      sample,
-      # sample_name if present in the design
-      dplyr::everything()
-    ) %>%
-    dplyr::select(
-      nterm_modif_peptide, 
-      sample, 
-      any_of(
-        c("sample_name", 
-        "Num_Quantified_per_cond", 
-        "Num_Missing_per_cond", 
-        "Proportion_Missing", 
-        "Total_Replicates", 
-        "Missingness_Category", 
-        "imputation_method"))) %>%
-    dplyr::distinct()
-
-  # build imputed wide matrix for return
-  quant_peptide_data_imputed <- df_example_partial_missing_imp %>%
-    dplyr::select(
-      nterm_modif_peptide, 
-      sample, 
-      Abundance) %>%
-    tidyr::pivot_wider(
-      names_from = sample, 
-      values_from = Abundance)
-
-  mat_quant_pept_imp <- quant_peptide_data_imputed %>%
-    tibble::column_to_rownames(
-      var = "nterm_modif_peptide") %>%
-    as.matrix()
-
-  # Construct SummarizedExperiment to return
-  rowData_new <- SummarizedExperiment::rowData(se)[rownames(mat_quant_pept_imp), , drop = FALSE]
+  imputed_counts <- imputed_counts[retained_features, samples, drop = FALSE]
   se_imputed <- SummarizedExperiment::SummarizedExperiment(
-    assays = list(counts = mat_quant_pept_imp),
+    assays = list(counts = imputed_counts),
     colData = SummarizedExperiment::colData(se),
-    rowData = rowData_new
+    rowData = SummarizedExperiment::rowData(se)[retained_features, , drop = FALSE]
   )
 
-  # Return a list with the SummarizedExperiment and the imputation summary table
   return(list(
     se = se_imputed,
     imputation_summary_table = imputation_summary_table,

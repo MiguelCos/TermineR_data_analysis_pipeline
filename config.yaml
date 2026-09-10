@@ -31,6 +31,7 @@ common:
   missing_accepted: 0.5
   tune_sigma: 1
   tune_quantile: 0.0000001
+  imputation_seed: 1
   pre_fix: xx000_projectname_analysis_type
 
   interesting_specificity:

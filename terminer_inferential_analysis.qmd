@@ -362,6 +362,11 @@ for (ds in names(limma_results_list)) {
     left_join(
       prot2gene,
       by = c("protein" = "protein")
+    ) %>%
+    left_join(
+      protein_annotation %>%
+        dplyr::select(protein, protein_description),
+      by = "protein"
     )
 
   write_tsv(

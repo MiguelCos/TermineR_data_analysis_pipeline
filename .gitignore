@@ -51,3 +51,6 @@ rsconnect/
 # internal reference files
 reference_files/
 data/example_fragpipe_tmt_search/
+
+# Cached analysis outputs
+rds/
