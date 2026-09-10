@@ -550,7 +550,8 @@ if (file.exists(rds_path_prepared)) {
       se = se_pept_imp_raw,
       min_fraction_condition = missing_accepted,
       tune_sigma = tune_sigma,
-      tune_quantile = tune_quantile
+      tune_quantile = tune_quantile,
+      seed = if ("imputation_seed" %in% names(config)) config$imputation_seed else 1L
     )
     
     se_pept_imp_raw <- se_pept_imp_raw_imputation_list$se

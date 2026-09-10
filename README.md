@@ -204,6 +204,7 @@ The `common` section stores parameters shared across the pipeline, while `stages
 | `missing_accepted` | Maximum missing fraction allowed within a condition before a feature is treated as too sparse for direct use. | `0.5` |
 | `tune_sigma` | Multiplicative factor applied to the imputation standard deviation for minimum-probability sampling. | `1` |
 | `tune_quantile` | Low quantile used to estimate the sample-specific imputation floor. | `0.0000001` |
+| `imputation_seed` | Non-negative integer seed for fresh imputation runs; `null` uses the current random stream. Seeded runs restore the caller's R random state. | `1` |
 | `pre_fix` | Prefix used to name cached `.rds` files and result tables across the entire pipeline. | `terminer_analysis_01` |
 | `interesting_specificity` | Specificity classes considered “in scope” for PCA and downstream feature filtering. | `[semi_Nterm, semi_Cterm]` |
 | `interesting_nterm_modif` | N-terminal modification classes considered "in scope" for PCA and downstream filtering. Quote `"n"` in YAML so it is not parsed as a boolean. | `["n", Acetyl]` |
@@ -347,6 +348,31 @@ project_root/
    - Missing value analysis.
    - Missing value imputation if necessary.
    - Store intermediary results for further analysis.
+
+### Missing-value imputation
+
+For non-TMT data, `terminer_imputation()` operates on the log2-scale peptide-by-sample abundance matrix. It preserves observed abundances, sample order, and annotations for retained features, and processes missing values as follows:
+
+1. **Calculate missingness within each condition.** For each peptide, the missing fraction is the number of missing sample measurements divided by the total number of samples in that condition. The summary records this denominator as `Total_Samples`; `Total_Replicates` separately records the number of distinct biological replicate IDs.
+2. **Exclude sparse features.** A peptide is excluded if its missing fraction exceeds `missing_accepted` in every condition. The default threshold is `0.5`.
+3. **Impute highly missing conditions by minimum-probability sampling.** For retained peptides, missing measurements in a condition above the threshold are labelled `Total_Missing` and replaced with Gaussian draws. This label includes partially observed conditions above the threshold, not only conditions with all measurements missing. The Gaussian mean is the sample's `tune_quantile` quantile of observed abundances among retained features. Its standard deviation is the median of the per-peptide standard deviations, multiplied by `tune_sigma`; this estimate uses peptides observed in at least half of all samples and in at least two samples. One value is drawn per missing measurement.
+4. **Impute remaining partial missing values with `rrcovNA::impSeqRob()`.** Missing measurements in conditions at or below the threshold are labelled `Partial_Missing`. After minimum-probability sampling, the remaining incomplete peptide-by-sample matrix is passed to `impSeqRob`. The output summary labels successful replacements as `minProb_dist` or `impSeqRob`, and observed measurements as `not_imputed`.
+
+Imputation stops with an explanatory error if no features remain, a retained sample has no observed values, required distribution parameters cannot be estimated, or `impSeqRob` fails or leaves non-finite replacements. Install `rrcovNA` when partial missing values need imputation. Complete matrices skip the `impSeqRob` step. TMT workflows use complete-case filtering instead of this imputation procedure.
+
+**Repeated-measures caveat:** Review and adapt the missingness and imputation code for repeated-measures experiments, including when the same individual is measured across time, across different conditions, or several times within a condition. The current procedure chooses the imputation method from pooled sample missingness within each condition; it does not explicitly use individual IDs, pairing, or time order to model repeated measurements. Individuals with more measurements can therefore contribute more to the missingness calculation. Enabling `use_blocking` in the downstream limma analysis accounts for repeated observations during model fitting, but does not change the imputation procedure.
+
+`imputation_seed` defaults to `1`, including for older configuration files without this key. An explicit `null` uses the caller's random stream. Reproducibility assumes the same input ordering, R random-number settings, and package versions.
+
+Existing caches are still reused by prefix. To apply these corrections or changed imputation settings to an existing analysis, move aside its `<pre_fix>_prepared_n_imputed_data.rds` and `<pre_fix>_imputation_list.rds` caches before rerunning preparation, and regenerate dependent exploratory and inferential outputs. Changing the seed alone does not invalidate cached results.
+
+Run the synthetic imputation regression tests from the repository root with:
+
+```sh
+Rscript --vanilla tests/testthat.R
+```
+
+The tests require `testthat`, `withr`, `SummarizedExperiment`, `dplyr`, `tidyr`, `tibble`, and `rrcovNA`.
 
 ### 2. Exploratory analysis
 1. Open `terminer_exploratory_analysis.qmd`
